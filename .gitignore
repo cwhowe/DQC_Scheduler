@@ -1,0 +1,40 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Project outputs ---
+results/
+outputs/
+*.csv
+*.png
+*.pdf
+
+# If you want to keep small CSVs or figures for papers, remove the above
+# and instead ignore only large/busy outputs like:
+# results/**/*
+# !results/README.md
+
+# --- Logs ---
+*.log
+
+# --- Qiskit / runtime caches (optional) ---
+.qiskit/
