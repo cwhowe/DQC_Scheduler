@@ -28,13 +28,8 @@ outputs/
 *.png
 *.pdf
 
-# If you want to keep small CSVs or figures for papers, remove the above
-# and instead ignore only large/busy outputs like:
-# results/**/*
-# !results/README.md
-
 # --- Logs ---
 *.log
 
-# --- Qiskit / runtime caches (optional) ---
+# --- Qiskit caches ---
 .qiskit/
