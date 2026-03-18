@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Tuple, List
 import hashlib
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from qiskit import QuantumCircuit
 from qiskit.quantum_info import SparsePauliOp, PauliList
@@ -322,10 +323,21 @@ class Executor:
             if max_local is None:
                 max_local = qpu.max_connected_free_qubits(now_s)
 
-            part = self.cfg.cut_strategy.partition(job.circuit, cc, {"max_local_qubits": max_local, "observable": job.observables, "qpu_candidates": [qid]})
+            det = plan.details or {}
+            preferred_subs = det.get("partition_subcircuits", None)
+            if preferred_subs:
+                class _StoredPartition:
+                    pass
+                part = _StoredPartition()
+                part.subcircuits = list(preferred_subs)
+                part.k_wire = det.get("k_wire", None)
+                part.k_gate = det.get("k_gate", None)
+                part.est_executions = det.get("sampling_overhead", None)
+                part.reconstruction = None
+            else:
+                part = self.cfg.cut_strategy.partition(job.circuit, cc, {"max_local_qubits": max_local, "observable": job.observables, "qpu_candidates": [qid]})
             aux["partition"] = part
             aux["cut_metadata"] = {"k_wire": getattr(part, "k_wire", None), "k_gate": getattr(part, "k_gate", None), "est_executions": getattr(part, "est_executions", None)}
-            det = plan.details or {}
             qdelay = float(det.get("pred_queue_delay_s", float(getattr(qpu.profile, "base_queue_delay_s", 0.0)) or 0.0))
             cursor = float(now_s) + qdelay
 
@@ -380,7 +392,19 @@ class Executor:
             needed_labels = max(2, int(math.ceil(float(job.circuit.num_qubits) / float(max_local_safe))))
             cc.target_labels = int(max(needed_labels, int(getattr(cc, "target_labels", needed_labels) or needed_labels)))
 
-            part = self.cfg.cut_strategy.partition(job.circuit, cc, {"max_local_qubits": max_local_safe, "observable": job.observables, "qpu_candidates": qpu_ids})
+            det = plan.details or {}
+            preferred_subs = det.get("partition_subcircuits", None)
+            if preferred_subs:
+                class _StoredPartition:
+                    pass
+                part = _StoredPartition()
+                part.subcircuits = list(preferred_subs)
+                part.k_wire = det.get("k_wire", None)
+                part.k_gate = det.get("k_gate", None)
+                part.est_executions = det.get("sampling_overhead", None)
+                part.reconstruction = None
+            else:
+                part = self.cfg.cut_strategy.partition(job.circuit, cc, {"max_local_qubits": max_local_safe, "observable": job.observables, "qpu_candidates": qpu_ids})
             aux["partition"] = part
 
             subs = list(getattr(part, "subcircuits", []) or [])
@@ -436,9 +460,12 @@ class Executor:
                         label_qpu_pred_time=label_qpu_pred,
                     )
             aux["assignment"] = assignment
-            det = plan.details or {}
-            qdelay = float(det.get("pred_queue_delay_s", 0.0) or 0.0)
-            cursors = {qid: float(now_s) + qdelay for qid in qpu_ids}
+            per_qpu_wait_s = {}
+            try:
+                per_qpu_wait_s = dict((plan.details or {}).get("per_qpu_wait_s", {}) or {})
+            except Exception:
+                per_qpu_wait_s = {}
+            cursors = {qid: float(now_s) + float(per_qpu_wait_s.get(qid, per_qpu_wait_s.get(str(qid), 0.0)) or 0.0) for qid in qpu_ids}
 
             for i, sc in enumerate(subs):
                 qid = str(assignment[i])
@@ -501,7 +528,42 @@ class Executor:
         if part is None:
             return None, extra
 
-        # If no reconstruction metadata, nothing to execute/reconstruct
+        # If the stored partition came from planner details only, rebuild once here with observable metadata.
+        if not isinstance(getattr(part, "reconstruction", None), dict) or "subexperiments" not in getattr(part, "reconstruction", {}):
+            try:
+                if plan.kind == "B_CUT_SINGLE_SEQ":
+                    qid = str(plan.qpu_id)
+                    max_local = (plan.details or {}).get("max_local_qubits", None)
+                    if max_local is None:
+                        max_local = self.qpus[qid].max_connected_free_qubits(0.0)
+                    cc = CutConstraints(
+                        max_cuts=min(self.cfg.cut_constraints.max_cuts, job.constraints.max_cuts),
+                        allow_gate_cuts=self.cfg.cut_constraints.allow_gate_cuts,
+                        allow_wire_cuts=self.cfg.cut_constraints.allow_wire_cuts,
+                        reconstruction_target=self.cfg.cut_constraints.reconstruction_target,
+                        target_labels=(plan.details or {}).get("target_labels", None),
+                        target_labels_cap=int(getattr(self.cfg.cut_constraints, "target_labels_cap", 4) or 4),
+                        seed_tries=int(getattr(self.cfg.cut_constraints, "seed_tries", 4) or 4),
+                    )
+                    part = self.cfg.cut_strategy.partition(job.circuit, cc, {"max_local_qubits": max_local, "observable": job.observables, "qpu_candidates": [qid]})
+                elif plan.kind == "C_CUT_MULTI_QPU":
+                    qpu_ids = (plan.details or {}).get("qpu_candidates", []) or list(self.qpus.keys())
+                    max_local = min(int(self.qpus[qid].max_connected_free_qubits(0.0)) for qid in qpu_ids) if qpu_ids else 0
+                    cc = CutConstraints(
+                        max_cuts=min(self.cfg.cut_constraints.max_cuts, job.constraints.max_cuts),
+                        allow_gate_cuts=self.cfg.cut_constraints.allow_gate_cuts,
+                        allow_wire_cuts=self.cfg.cut_constraints.allow_wire_cuts,
+                        reconstruction_target=self.cfg.cut_constraints.reconstruction_target,
+                        target_labels=(plan.details or {}).get("target_labels", None),
+                        target_labels_cap=int(getattr(self.cfg.cut_constraints, "target_labels_cap", 4) or 4),
+                        seed_tries=int(getattr(self.cfg.cut_constraints, "seed_tries", 4) or 4),
+                    )
+                    part = self.cfg.cut_strategy.partition(job.circuit, cc, {"max_local_qubits": max(2, int(max_local)), "observable": job.observables, "qpu_candidates": qpu_ids})
+                aux["partition"] = part
+            except Exception:
+                extra["cut_error"] = getattr(part, "reconstruction", None)
+                return None, extra
+
         if not isinstance(getattr(part, "reconstruction", None), dict) or "subexperiments" not in part.reconstruction:
             extra["cut_error"] = getattr(part, "reconstruction", None)
             return None, extra
@@ -528,12 +590,33 @@ class Executor:
                 results_by_label[lab] = sampler.run(pubs).result()
         else:
             assignment = aux.get("assignment", {}) or {}
-            for lab, circs in subexperiments.items():
+            per_label_wall_s: Dict[int, float] = {}
+            per_label_qpu: Dict[int, str] = {}
+
+            def _run_label(lab, circs):
                 qid = str(assignment.get(int(lab), assignment.get(lab)))
                 nm = _safe_noise_model(getattr(self.quality, "noise_models", {}).get(qid))
                 sampler = SamplerV2(options={"backend_options": {"noise_model": nm}}) if nm is not None else SamplerV2()
                 pubs = [(c, None, int(job.shots or 0) or self.cfg.shots_default) for c in circs]
-                results_by_label[lab] = sampler.run(pubs).result()
+                t_lab0 = time.perf_counter()
+                res = sampler.run(pubs).result()
+                t_lab1 = time.perf_counter()
+                return lab, qid, res, float(t_lab1 - t_lab0)
+
+            used_qpus = sorted({str(assignment.get(int(lab), assignment.get(lab))) for lab in subexperiments.keys()})
+            max_workers = max(1, min(len(subexperiments), len(used_qpus)))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futs = [pool.submit(_run_label, lab, circs) for lab, circs in subexperiments.items()]
+                for fut in as_completed(futs):
+                    lab, qid, res, wall_s = fut.result()
+                    results_by_label[lab] = res
+                    per_label_wall_s[int(lab)] = float(wall_s)
+                    per_label_qpu[int(lab)] = str(qid)
+
+            extra["c_parallel_workers"] = int(max_workers)
+            extra["c_parallel_used_qpus"] = list(used_qpus)
+            extra["c_parallel_label_wall_s"] = dict(sorted(per_label_wall_s.items()))
+            extra["c_parallel_label_qpu"] = dict(sorted(per_label_qpu.items()))
 
         t_exec1 = time.perf_counter()
 
@@ -647,7 +730,7 @@ class Executor:
         reserve = bool(getattr(toggles, "simulate_only", False) or getattr(self.cfg, "reserve_nonsim", False))
         reserve_info = self.apply_reservations(tasks, now_s=now_s, reserve=reserve)
 
-        # Phase 3: maybe execute (Aer primitives) + reconstruction
+        # Phase 3: execute (Aer primitives) + reconstruction
         out, exec_extra = self.maybe_execute(job, plan, aux, toggles)
 
         # Phase 4: assemble record (also adds COMM/RECON tasks to graph)

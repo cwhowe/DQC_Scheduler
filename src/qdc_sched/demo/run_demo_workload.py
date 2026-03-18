@@ -72,6 +72,54 @@ def _parse_int_list(env_name: str, default_csv: str) -> List[int]:
     return out
 
 
+
+
+def _parse_float_list(env_name: str, default_csv: str) -> List[float]:
+    raw = os.getenv(env_name, default_csv)
+    out: List[float] = []
+    for x in raw.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        out.append(float(x))
+    return out
+
+
+def build_expectation_circuit(n: int, rng: random.Random, *, family: str, depth: int | None = None) -> QuantumCircuit:
+    fam = (family or "ghz").strip().lower()
+    if fam == "ghz":
+        return ghz(n, measure=False)
+    if fam in ("random_cx", "randcx", "cx"):
+        d = int(depth if depth is not None else max(4, 2 * n))
+        return random_cx(n, d, measure=False)
+    if fam in ("ghz_then_mix", "hybrid"):
+        qc = ghz(n, measure=False)
+        d = int(depth if depth is not None else max(4, n))
+        mix = random_cx(n, d, measure=False)
+        qc.compose(mix, inplace=True)
+        return qc
+    raise ValueError(f"Unsupported QDC_WIDE_FAMILY={family!r}")
+
+
+def _planned_wide_submit_times(n_wide: int, rng: random.Random) -> List[float]:
+    if n_wide <= 0:
+        return []
+    align = os.getenv("QDC_WIDE_ALIGN_TO_BURSTS", "1") == "1"
+    if not align:
+        return []
+    burst_starts = _parse_float_list("QDC_BURST_STARTS_S", "15,40")
+    jitter_choices = _parse_float_list("QDC_WIDE_BURST_JITTER_S", "-2.0,-1.0,-0.5,0.0,0.2,0.5,1.0,2.0")
+    times: List[float] = []
+    if not burst_starts:
+        return times
+    reps = (n_wide + len(burst_starts) - 1) // len(burst_starts)
+    anchors = (burst_starts * reps)[:n_wide]
+    rng.shuffle(anchors)
+    for a in anchors:
+        times.append(max(0.0, float(a) + float(rng.choice(jitter_choices))))
+    times.sort()
+    return times
+
 def make_workload(
     n_jobs: int | None = None,
     pct_expect: float | None = None,
@@ -99,23 +147,33 @@ def make_workload(
     wide_slots = set(rng.sample(range(n_jobs), k=n_wide)) if n_wide > 0 else set()
 
     wide_widths = _parse_int_list("QDC_WIDE_WIDTHS", "10,12,14,16")
+    wide_shots = _parse_int_list("QDC_WIDE_SHOTS", "500,1000,2000")
+    wide_depths = _parse_int_list("QDC_WIDE_DEPTHS", "16,24,32")
+    wide_family = os.getenv("QDC_WIDE_FAMILY", "random_cx")
+    wide_submit_times = _planned_wide_submit_times(n_wide, rng)
+    wide_submit_idx = 0
 
     for i in range(n_jobs):
         t += rng.choice([0.0, 0.1, 0.2, 0.5, 1.0])
         jid = f"J{i:03d}"
 
-        # Wide-slot jobs: always expectation; can exceed any single QPU to ensure cutting paths get exercised
+        # Wide-slot jobs: expectation circuits designed to stress the cut/distribute decision.
         if i in wide_slots:
             width = rng.choice(wide_widths)
-            shots = rng.choice([100, 200, 500])
-            qc = ghz(width, measure=False)
+            shots = rng.choice(wide_shots)
+            depth = rng.choice(wide_depths)
+            qc = build_expectation_circuit(width, rng, family=wide_family, depth=depth)
+            submit_t = t
+            if wide_submit_idx < len(wide_submit_times):
+                submit_t = float(wide_submit_times[wide_submit_idx])
+                wide_submit_idx += 1
             job = Job(
                 job_id=jid,
                 circuit=qc,
                 task_type="expectation",
                 observables=z_observable(width),
                 shots=shots,
-                submit_time_s=t,
+                submit_time_s=submit_t,
                 constraints=JobConstraints(
                     allow_cutting=True,
                     force_cutting=(os.getenv("QDC_FORCE_CUT_WIDE", "1") == "1"),
@@ -124,7 +182,7 @@ def make_workload(
                     comm_overhead_s=float(os.getenv("QDC_WIDE_COMM_OVERHEAD_S", "0.08")),
                 ),
             )
-            wl.append((t, job))
+            wl.append((submit_t, job))
             wide_ids.add(jid)
             continue
 
@@ -139,7 +197,9 @@ def make_workload(
 
         width = rng.choice(wide_widths)
         shots = rng.choice([100, 200, 500])
-        qc = ghz(width, measure=False)
+        med_family = os.getenv("QDC_MED_EXPECT_FAMILY", "ghz")
+        med_depths = _parse_int_list("QDC_MED_EXPECT_DEPTHS", "8,12,16")
+        qc = build_expectation_circuit(width, rng, family=med_family, depth=rng.choice(med_depths))
 
         force_cut = (os.getenv("QDC_FORCE_CUT_MED", "0") == "1")
         if width > int(os.getenv("QDC_FORCE_CUT_IF_GT", "9999")):
@@ -162,6 +222,7 @@ def make_workload(
         )
         wl.append((t, job))
 
+    wl.sort(key=lambda x: (float(x[0]), x[1].job_id))
     return wl, wide_ids
 
 
@@ -184,9 +245,16 @@ def _install_reserve_counters(qpus: Dict[str, QPUState]):
 
 def inject_congestion_bursts(qpus: Dict[str, QPUState]) -> None:
     burst_dur = float(os.getenv("QDC_CONGEST_BURST_S", "15.0"))
-    for i, t0 in enumerate([15.0, 40.0]):
-        k = qpus["qpu_B"].profile.num_qubits
-        qpus["qpu_B"].reserve(f"BLOCK_B_{i}", list(range(k)), start_s=t0, duration_s=burst_dur)
+    burst_starts = _parse_float_list("QDC_BURST_STARTS_S", "15,40")
+    block_targets = [x.strip() for x in os.getenv("QDC_BURST_TARGETS", "qpu_B").split(",") if x.strip()]
+    block_fraction = float(os.getenv("QDC_BURST_BLOCK_FRACTION", "1.0"))
+    for qid in block_targets:
+        if qid not in qpus:
+            continue
+        k_full = int(qpus[qid].profile.num_qubits)
+        k = max(1, min(k_full, int(round(k_full * block_fraction))))
+        for i, t0 in enumerate(burst_starts):
+            qpus[qid].reserve(f"BLOCK_{qid}_{i}", list(range(k)), start_s=float(t0), duration_s=burst_dur)
 
 
 def _install_plan_debug(sched: Scheduler, wide_job_ids: Set[str]) -> Counter:
@@ -342,7 +410,12 @@ def run_workload(full_eval: bool = False) -> None:
     print("aer_repeats:", os.getenv("QDC_AER_TIMING_REPEATS", "1"))
     print("jobs:", len(wl))
     print("congestion_burst_s:", float(os.getenv("QDC_CONGEST_BURST_S", "15.0")))
+    print("burst_starts_s:", _parse_float_list("QDC_BURST_STARTS_S", "15,40"))
     print("wide_jobs:", len(wide_ids))
+    print("wide_family:", os.getenv("QDC_WIDE_FAMILY", "random_cx"))
+    print("wide_depths:", _parse_int_list("QDC_WIDE_DEPTHS", "16,24,32"))
+    print("wide_shots:", _parse_int_list("QDC_WIDE_SHOTS", "500,1000,2000"))
+    print("wide_align_to_bursts:", os.getenv("QDC_WIDE_ALIGN_TO_BURSTS", "1") == "1")
 
     toggles = RunToggles(
         compute_estimated_fidelity=False,

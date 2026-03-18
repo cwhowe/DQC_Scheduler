@@ -224,51 +224,67 @@ class Planner:
         # Plan C: cut, multi-QPU parallel
         # -----------------
         if allow_cut and job.constraints.allow_multi_qpu and len(cut_qpu_pool) >= 2 and not _budget_exceeded():
-            candidates_qpus = [c[0] for c in cut_qpu_pool]
-            # Prefer distributing across QPUs that cannot fit the whole circuit (true multi-QPU case)
-            # This prevents a large QPU from collapsing Plan C into a single-label "no-cut" partition
-            if job.constraints.force_cutting:
-                small = [c[0] for c in cut_qpu_pool if int(c[3]) < int(prof.width)]
-                if len(small) >= 2:
-                    candidates_qpus = small
-            max_local = min(int(self.qpus[qid].max_connected_free_qubits(now_s)) for qid in candidates_qpus)  # smallest local capacity over chosen QPUs
+            all_candidates_qpus = [c[0] for c in cut_qpu_pool]
             cc0 = self.cfg.cut_constraints
-            # Ensure we ask for enough labels to make the circuit fit into max_local qubits.
             tl_raw = getattr(cc0, 'target_labels', None)
             tl0 = 2 if (tl_raw is None) else int(tl_raw)
-            needed_labels = max(tl0, int(math.ceil(float(prof.width) / float(max_local))))
-            chosen_labels = min(int(cc0.target_labels_cap), int(needed_labels))
-            cc = CutConstraints(
-                max_cuts=min(cc0.max_cuts, job.constraints.max_cuts),
-                allow_gate_cuts=cc0.allow_gate_cuts,
-                allow_wire_cuts=cc0.allow_wire_cuts,
-                reconstruction_target=cc0.reconstruction_target,
-                target_labels=int(chosen_labels),
-                target_labels_cap=cc0.target_labels_cap,
-                seed_tries=cc0.seed_tries,
-            )
-            part = None
-            try:
-                with _qdc_time_limit(_cut_timeout_s):
-                    part = self.cfg.cut_strategy.partition(job.circuit, cc, {"max_local_qubits": max_local, "qpu_candidates": candidates_qpus})
-            except TimeoutError:
+            allow_pack = os.getenv('QDC_C_ALLOW_PACK_LABELS', '1') not in ('0', 'false', 'False')
+
+            # Score Plan C on concrete multi-QPU subsets instead of one partition built against
+            # the entire pool. Otherwise the smallest QPU in the whole pool can force over-cutting
+            # even when a better pair (e.g. B+C) exists.
+            seen_subset_sig = set()
+            subset_list = []
+
+            # For now, score only 2-QPU distributed plans so C compares cleanly as:
+            # A+B, A+C, B+C
+            for subset in itertools.combinations(all_candidates_qpus, 2):
+                sig = tuple(sorted(subset))
+                if sig in seen_subset_sig:
+                    continue
+                seen_subset_sig.add(sig)
+                subset_list.append(list(subset))
+
+            for candidates_qpus in subset_list:
+                max_local = min(int(self.qpus[qid].max_connected_free_qubits(now_s)) for qid in candidates_qpus)
+                if max_local <= 0:
+                    continue
+
+                needed_labels = max(tl0, int(math.ceil(float(prof.width) / float(max_local))))
+                chosen_labels = min(int(cc0.target_labels_cap), int(needed_labels))
+                cc = CutConstraints(
+                    max_cuts=min(cc0.max_cuts, job.constraints.max_cuts),
+                    allow_gate_cuts=cc0.allow_gate_cuts,
+                    allow_wire_cuts=cc0.allow_wire_cuts,
+                    reconstruction_target=cc0.reconstruction_target,
+                    target_labels=int(chosen_labels),
+                    target_labels_cap=cc0.target_labels_cap,
+                    seed_tries=cc0.seed_tries,
+                )
+
                 part = None
-            except Exception as e:
-                    if os.getenv("QDC_DEBUG_CUT_ERRORS", "0") == "1":
-                        print(f"[CUT-ERR] job={job.job_id} qpu={qpu_id} err={e}")
+                try:
+                    with _qdc_time_limit(_cut_timeout_s):
+                        part = self.cfg.cut_strategy.partition(
+                            job.circuit,
+                            cc,
+                            {"max_local_qubits": max_local, "qpu_candidates": candidates_qpus},
+                        )
+                except TimeoutError:
                     part = None
-            if part is None:
-                # cut timed out / failed this step (skip scoring Plan C this tick)
-                part = None
-            # Plan C requires a distributable partition.
-            if (not getattr(part, 'subcircuits', None)) or (len(part.subcircuits) < int(needed_labels)):
-                part = None
-            if part is not None:
+                except Exception as e:
+                    if os.getenv("QDC_DEBUG_CUT_ERRORS", "0") == "1":
+                        print(f"[CUT-ERR] job={job.job_id} qpus={candidates_qpus} err={e}")
+                    part = None
+
+                if part is None:
+                    continue
+                if (not getattr(part, 'subcircuits', None)) or (len(part.subcircuits) < int(needed_labels)):
+                    continue
+
                 labels = list(range(len(part.subcircuits)))
-                # Per-label cost proxy
                 sub_profiles = [profile_circuit(sc) for sc in part.subcircuits]
                 label_costs = {i: float(sp.twoq_count + 0.2 * sp.oneq_count) for i, sp in enumerate(sub_profiles)}
-                # Per-label per-QPU predicted device-time
                 label_qpu_pred_time = {i: {} for i in labels}
                 for i, sp in enumerate(sub_profiles):
                     for qid in candidates_qpus:
@@ -278,12 +294,8 @@ class Planner:
                 qpu_quality = {qid: float(self.quality.fidelity_proxy_from_profile(qid, prof)) for qid in candidates_qpus}
                 qpu_pred_time = {qid: float(self.qpus[qid].profile.base_queue_delay_s or 0.0) for qid in candidates_qpus}
 
-                # Allow packing multiple labels onto the same QPU (still a multi-QPU plan if >=2 QPUs used).
-                # This makes Plan C feasible even when the partitioner produces >#QPUs labels.
-                allow_pack = os.getenv('QDC_C_ALLOW_PACK_LABELS', '1') not in ('0', 'false', 'False')
                 if allow_pack:
-                    # brute force is fine here: labels are tiny (usually <=4) and QPUs <=3
-                    best = None  # (makespan, total, assignment, used_qpus)
+                    best_assign = None  # (makespan, total, assignment, used_qpus)
                     for choice in itertools.product(candidates_qpus, repeat=len(labels)):
                         used = set(choice)
                         if len(used) < 2:
@@ -294,51 +306,59 @@ class Planner:
                         makespan = max(loads.values()) if loads else float('inf')
                         total = sum(loads.values()) if loads else float('inf')
                         cand = (makespan, total, dict(zip(labels, choice)), used)
-                        if best is None or cand[:2] < best[:2]:
-                            best = cand
-                    if best is None:
-                        skips.setdefault('C', []).append('insufficient_cut_qpus')
-                        # fall back to a degenerate single-QPU assignment (will make C unattractive but keeps us running)
-                        assignment = {labels[0]: candidates_qpus[0]}
-                        makespan = float('inf')
-                    else:
-                        makespan, _total, assignment, _used_qpus = best
+                        if best_assign is None or cand[:2] < best_assign[:2]:
+                            best_assign = cand
+                    if best_assign is None:
+                        continue
+                    makespan, _total, assignment, used_qpus = best_assign
                 else:
                     assigner = MinMakespanGreedyAssignment()
-                    assignment = assigner.assign(labels, candidates_qpus,
-                                                 label_costs=label_costs,
-                                                 qpu_caps=qpu_caps,
-                                                 qpu_quality=qpu_quality,
-                                                 qpu_pred_time=qpu_pred_time,
-                                                 label_qpu_pred_time=label_qpu_pred_time)
-                    # Makespan under assignment (one label per QPU)
-                    makespan = 0.0
-                    for lab in labels:
-                        makespan = max(makespan, float(label_qpu_pred_time[lab][assignment[lab]]))
+                    assignment = assigner.assign(
+                        labels,
+                        candidates_qpus,
+                        label_costs=label_costs,
+                        qpu_caps=qpu_caps,
+                        qpu_quality=qpu_quality,
+                        qpu_pred_time=qpu_pred_time,
+                        label_qpu_pred_time=label_qpu_pred_time,
+                    )
+                    used_qpus = set(assignment.values())
+                    if len(used_qpus) < 2:
+                        continue
+                    loads = {q: 0.0 for q in used_qpus}
+                    for lab, q in assignment.items():
+                        loads[q] += float(label_qpu_pred_time[lab][q])
+                    makespan = max(loads.values()) if loads else float('inf')
 
                 sampling = float(part.est_executions or 1.0)
-                # global reconstruction estimate (we do it once, this can be real too)
-                any_q = candidates_qpus[0]
+                per_qpu_wait_s = {}
+                for qid in used_qpus:
+                    assigned_labs = [lab for lab, q in assignment.items() if q == qid]
+                    need_w = max(int(sub_profiles[lab].width) for lab in assigned_labs) if assigned_labs else int(prof.width)
+                    base_d = float(getattr(self.qpus[qid].profile, 'base_queue_delay_s', 0.0) or 0.0)
+                    start_probe_s = float(now_s) + float(base_d)
+                    per_qpu_wait_s[qid] = base_d + _wait_s(qid, need_w, start_probe_s)
+
+                pred_finish = 0.0
+                for qid in used_qpus:
+                    q_load = sum(float(label_qpu_pred_time[lab][qid]) for lab, q in assignment.items() if q == qid)
+                    pred_finish = max(pred_finish, float(per_qpu_wait_s.get(qid, 0.0)) + (q_load * sampling))
+
+                any_q = next(iter(used_qpus))
                 recon_base = float(getattr(self.qpus[any_q].profile, 'reconstruction_base_s', 0.0) or 0.0)
                 recon_per = float(getattr(self.qpus[any_q].profile, 'reconstruction_per_exec_s', 0.0) or 0.0)
                 recon_est = recon_base + recon_per * sampling
 
-                # Wait is dominated by the slowest participating QPU at its assigned label width.
-                waits = []
-                for lab, qpu_assigned in assignment.items():
-                    need_w = int(sub_profiles[lab].width) if 0 <= int(lab) < len(sub_profiles) else int(prof.width)
-                    base_d = float(getattr(self.qpus[qpu_assigned].profile, 'base_queue_delay_s', 0.0) or 0.0)
-                    start_probe_s = float(now_s) + float(base_d)
-                    waits.append(base_d + _wait_s(qpu_assigned, need_w, start_probe_s))
-                wait_c = max(waits) if waits else 0.0
-                pred_total = float(wait_c) + (float(makespan) * sampling) + float(job.constraints.comm_overhead_s) + float(recon_est)
-                fid_proxy = max(float(self.quality.fidelity_proxy_from_profile(qid, prof)) for qid in candidates_qpus)
-                pred_queue = float(wait_c)                      # max over assigned-QPU queue+wait
-                pred_exec  = float(makespan)                    # service makespan (NO queue)
+                used_qpus_list = sorted(list(used_qpus))
+                pred_comm = float(job.constraints.comm_overhead_s or 0.0) if len(used_qpus_list) >= 2 else 0.0
+                pred_queue = max(float(per_qpu_wait_s.get(qid, 0.0)) for qid in used_qpus_list) if used_qpus_list else 0.0
+                pred_exec = max(
+                    sum(float(label_qpu_pred_time[lab][qid]) for lab, q in assignment.items() if q == qid)
+                    for qid in used_qpus_list
+                ) if used_qpus_list else float('inf')
                 pred_recon = float(recon_est)
-                pred_comm  = float(job.constraints.comm_overhead_s or 0.0)
-
-                pred_total = pred_queue + (pred_exec * float(sampling)) + pred_comm + pred_recon
+                pred_total = float(pred_finish) + pred_comm + pred_recon
+                fid_proxy = max(float(self.quality.fidelity_proxy_from_profile(qid, prof)) for qid in used_qpus_list)
 
                 candidates.append(Plan(
                     kind="C_CUT_MULTI_QPU",
@@ -352,11 +372,14 @@ class Planner:
                         "sampling_overhead": float(sampling),
                         "pred_recon_s": pred_recon,
                         "pred_comm_s": pred_comm,
-                        "qpu_candidates": candidates_qpus,
+                        "qpu_candidates": list(candidates_qpus),
+                        "used_qpus": used_qpus_list,
+                        "subset_signature": "+".join(sorted(used_qpus_list)),
                         "labels_used": len(labels),
                         "recon_est_s": pred_recon,
-                        "predicted_makespan_s": float(makespan),
-                        "wait_est_s": float(wait_c),
+                        "predicted_makespan_s": float(pred_exec),
+                        "wait_est_s": float(pred_queue),
+                        "per_qpu_wait_s": dict(per_qpu_wait_s),
                         "k_wire": int(part.k_wire),
                         "k_gate": int(part.k_gate),
                         "assignment": assignment,
@@ -373,23 +396,25 @@ class Planner:
         for plan in candidates:
             if slo is not None and plan.predicted_total_time_s > float(slo):
                 continue
-            # Optional quality penalty
+
             plan.score = self.cfg.weight_time * float(plan.predicted_total_time_s)
-            if self.cfg.weight_quality <= 0.0:
-                debug_scores[f"{plan.kind}:{getattr(plan,'qpu_id',None)}"] = {
-                    'pred_total_s': float(plan.predicted_total_time_s),
-                    'fid_proxy': float(plan.predicted_fidelity_proxy),
-                    'score': float(plan.score),
-                    'slo_ok': (slo is None) or (float(plan.predicted_total_time_s) <= float(slo)),
-                }
             if self.cfg.weight_quality > 0.0:
                 plan.score += self.cfg.weight_quality * (1.0 - float(plan.predicted_fidelity_proxy))
-            debug_scores[f"{plan.kind}:{getattr(plan,'qpu_id',None)}"] = {
+
+            if getattr(plan, "kind", "") == "C_CUT_MULTI_QPU":
+                used = plan.details.get("used_qpus", []) if plan.details else []
+                cand = plan.details.get("qpu_candidates", []) if plan.details else []
+                dbg_key = f"{plan.kind}:{'+'.join(map(str, used)) or 'none'}|cand={'+'.join(map(str, cand)) or 'none'}"
+            else:
+                dbg_key = f"{plan.kind}:{getattr(plan, 'qpu_id', None)}"
+
+            debug_scores[dbg_key] = {
                 'pred_total_s': float(plan.predicted_total_time_s),
                 'fid_proxy': float(plan.predicted_fidelity_proxy),
                 'score': float(plan.score),
                 'slo_ok': (slo is None) or (float(plan.predicted_total_time_s) <= float(slo)),
             }
+
             if best is None or plan.score < best.score:
                 best = plan
 
