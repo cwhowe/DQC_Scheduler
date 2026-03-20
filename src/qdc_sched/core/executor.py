@@ -523,6 +523,11 @@ class Executor:
         if plan.kind == "A_NO_CUT_SINGLE":
             return None, extra
 
+        # Fast path: if compute_expectation is False, don't execute heavy workloads or rebuild reconstruction data.
+        if not bool(getattr(toggles, "compute_expectation", True)):
+            extra["execution_mode"] = "timing_only"
+            return None, extra
+
         # Plan B/C: expectation jobs support reconstruction
         part = aux.get("partition", None)
         if part is None:
@@ -571,11 +576,6 @@ class Executor:
         subexperiments = part.reconstruction["subexperiments"]
         coefficients = part.reconstruction["coefficients"]
         subobservables = part.reconstruction["subobservables"]
-
-        # Fast path: if compute_expectation is False, don't execute heavy workloads
-        if not bool(getattr(toggles, "compute_expectation", True)):
-            extra["execution_mode"] = "timing_only"
-            return None, extra
 
         # Execute subexperiments with SamplerV2 (optionally per-qpu noise in C)
         t_exec0 = time.perf_counter()
@@ -717,6 +717,85 @@ class Executor:
         rec.details = _attach_timing_dicts(rec.details if isinstance(rec.details, dict) else {}, timing_model, timing_wall)
         return rec
 
+
+    def _build_tasks_from_plan_details_only(self, job: Job, plan: Plan, now_s: float) -> Tuple[List[Task], Dict[str, Any]]:
+        """Cheap fallback for timing-only runs when planner already supplied durations but not subcircuits."""
+        tasks: List[Task] = []
+        aux: Dict[str, Any] = {"task_reservations": []}
+        det = plan.details or {}
+
+        if plan.kind == "A_NO_CUT_SINGLE":
+            return self.build_task_graph(job, plan, now_s)
+
+        if plan.kind == "B_CUT_SINGLE_SEQ":
+            qid = str(plan.qpu_id)
+            labels_used = max(1, int(det.get("labels_used", 1) or 1))
+            qdelay = float(det.get("pred_queue_delay_s", 0.0) or 0.0)
+            total_exec = float(det.get("pred_exec_time_s", 0.0) or 0.0)
+            sampling = float(det.get("sampling_overhead", 1.0) or 1.0)
+            approx_total = max(0.0, total_exec * sampling)
+            per_label = approx_total / float(labels_used)
+            cursor = float(now_s) + qdelay
+            max_local = int(det.get("max_local_qubits", max(1, job.circuit.num_qubits)) or max(1, job.circuit.num_qubits))
+            k_each = max(1, min(max_local, job.circuit.num_qubits))
+            for i in range(labels_used):
+                tasks.append(Task(
+                    task_id=f"{job.job_id}:B{i}",
+                    job_id=job.job_id,
+                    kind="quantum",
+                    qpu_id=qid,
+                    qubits=None,
+                    start_s=float(cursor),
+                    end_s=float(cursor + per_label),
+                    label=int(i),
+                    depends_on=None,
+                    metadata={"plan": plan.kind, "k": int(k_each), "approx_from_plan": True, "subcircuit_index": i},
+                ))
+                cursor += per_label
+            return tasks, aux
+
+        if plan.kind == "C_CUT_MULTI_QPU":
+            qpu_ids = list((det.get("qpu_candidates", []) or [])) or list(self.qpus.keys())
+            assignment = det.get("assignment", {}) or {}
+            labels_used = max(1, int(det.get("labels_used", len(assignment) or 1) or 1))
+            qdelay = float(det.get("pred_queue_delay_s", 0.0) or 0.0)
+            makespan = float(det.get("predicted_makespan_s", det.get("pred_exec_time_s", 0.0)) or 0.0)
+            per_qpu_wait_s = dict(det.get("per_qpu_wait_s", {}) or {})
+            max_local = int(det.get("max_local_qubits", max(1, min((self.qpus[q].max_connected_free_qubits(now_s) for q in qpu_ids), default=job.circuit.num_qubits))) or job.circuit.num_qubits)
+            if not assignment:
+                # round-robin fallback
+                qpu_ids2 = qpu_ids or list(self.qpus.keys())
+                assignment = {i: qpu_ids2[i % len(qpu_ids2)] for i in range(labels_used)}
+            counts = {}
+            for _lab, qid in assignment.items():
+                counts[str(qid)] = counts.get(str(qid), 0) + 1
+            per_label_dur = {}
+            for qid, cnt in counts.items():
+                usable = max(1, int(cnt))
+                per_label_dur[qid] = max(0.0, makespan) / float(usable)
+            cursor_by_qpu = {str(qid): float(now_s) + float(per_qpu_wait_s.get(str(qid), qdelay)) for qid in set(map(str, assignment.values()))}
+            for i in range(labels_used):
+                qid = str(assignment.get(i, assignment.get(str(i), qpu_ids[i % len(qpu_ids)] if qpu_ids else None)))
+                dur = per_label_dur.get(qid, max(0.0, makespan))
+                start = cursor_by_qpu.get(qid, float(now_s) + qdelay)
+                tasks.append(Task(
+                    task_id=f"{job.job_id}:C{i}",
+                    job_id=job.job_id,
+                    kind="quantum",
+                    qpu_id=qid,
+                    qubits=None,
+                    start_s=float(start),
+                    end_s=float(start + dur),
+                    label=int(i),
+                    depends_on=None,
+                    metadata={"plan": plan.kind, "k": int(max_local), "approx_from_plan": True, "subcircuit_index": i},
+                ))
+                cursor_by_qpu[qid] = float(start + dur)
+            aux["assignment"] = assignment
+            return tasks, aux
+
+        return tasks, aux
+
     def run_job_plan(self, job: Job, plan: Plan, now_s: float, toggles: RunToggles) -> Any:
         if plan.kind == "D_WAIT":
             return None
@@ -724,7 +803,12 @@ class Executor:
         t0_wall = time.perf_counter()
 
         # Phase 1: build tasks (quantum tasks only)
-        tasks, aux = self.build_task_graph(job, plan, now_s)
+        timing_only = not bool(getattr(toggles, "compute_expectation", True))
+        has_stored_partition = bool((plan.details or {}).get("partition_subcircuits", None))
+        if timing_only and plan.kind in ("B_CUT_SINGLE_SEQ", "C_CUT_MULTI_QPU") and not has_stored_partition:
+            tasks, aux = self._build_tasks_from_plan_details_only(job, plan, now_s)
+        else:
+            tasks, aux = self.build_task_graph(job, plan, now_s)
 
         # Phase 2: reserve resources
         reserve = bool(getattr(toggles, "simulate_only", False) or getattr(self.cfg, "reserve_nonsim", False))

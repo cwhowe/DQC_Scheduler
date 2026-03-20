@@ -1,37 +1,37 @@
 from __future__ import annotations
-import os
-from typing import Any, Dict, Optional, Tuple, List
+
 import math
+import os
 import time
+from typing import Any, Dict, Optional
 
 from qiskit import QuantumCircuit
-from qiskit.quantum_info import SparsePauliOp, PauliList
+from qiskit.quantum_info import PauliList, SparsePauliOp
 
-from .base import CutStrategy, CutConstraints, PartitionPlan, CutAnalysis
+from .base import CutAnalysis, CutConstraints, CutStrategy, PartitionPlan
 
 
-# -------------------------
-# Fast/approx partition toggles (demo / planning)
-# -------------------------
 _QDC_CUT_FAST_PARTITION = os.environ.get("QDC_CUT_FAST_PARTITION", "0") not in ("0", "", "false", "False")
 _QDC_CUT_FALLBACK_PARTITION = os.environ.get("QDC_CUT_FALLBACK_PARTITION", "1") not in ("0", "", "false", "False")
 
-def _naive_chunk_partition(circuit, max_subq: int):
-    """Fallback: split logical qubits into contiguous chunks of size <= max_subq.
-    This is **only** intended for analytic planning/demo when full QPD decomposition is too expensive.
-    Returns list of (label, subcircuit) for PartitionPlan.subcircuits.
+
+def _naive_chunk_partition(circuit: QuantumCircuit, max_subq: int):
+    """Split logical qubits into contiguous chunks of size <= max_subq.
+
+    This is intentionally approximate and is meant for planner/demo timing only.
+    Cross-chunk operations are dropped so width/depth/2q-count stay cheap to estimate.
     """
-    from qiskit.circuit import QuantumCircuit
+    from qiskit.circuit import QuantumCircuit as Qc
+
     n = circuit.num_qubits
     if max_subq <= 0 or max_subq >= n:
         return [(0, circuit)]
+
     chunks = []
     label = 0
     for start in range(0, n, max_subq):
         qs = list(range(start, min(n, start + max_subq)))
-        sub = QuantumCircuit(len(qs), name=f"sub_{label}")
-        # Rebuild a *very* rough circuit: copy over 1q/2q gates that stay within the chunk, ignore cross-chunk ops.
-        # For analytic timing, width/depth/2q-count approximations are what matter most.
+        sub = Qc(len(qs), name=f"sub_{label}")
         idx_map = {q: i for i, q in enumerate(qs)}
         for inst, qargs, cargs in circuit.data:
             qids = [circuit.find_bit(q).index for q in qargs]
@@ -52,23 +52,18 @@ def _to_paulilist(obs: Any) -> PauliList:
     raise TypeError(f"Unsupported observable type for cutting: {type(obs)}")
 
 
-def _coerce_observables(obs, n_qubits: int) -> PauliList:
-    """Coerce various observable container forms into a single PauliList.
-
-    qiskit_addon_cutting expects Pauli/PauliList-like objects (with .num_qubits).
-    We standardize to PauliList, where each entry is one Pauli string.
-    """
+def _coerce_observables(obs: Any, n_qubits: int) -> PauliList:
     if obs is None:
         return PauliList(["Z" + "I" * (n_qubits - 1)])
-    if isinstance(obs, list) or isinstance(obs, tuple):
+    if isinstance(obs, (list, tuple)):
         pls = []
         for o in obs:
-            pl = _to_paulilist(o)
-            pls.extend(list(pl))
+            pls.extend(list(_to_paulilist(o)))
         return PauliList(pls)
     return _to_paulilist(obs)
+
+
 def _strip_classical_bits(circ: QuantumCircuit) -> QuantumCircuit:
-    """Cutting add-on requires no classical bits; expectation jobs should not contain measurements."""
     if circ.num_clbits == 0:
         return circ
     new = QuantumCircuit(circ.num_qubits)
@@ -80,20 +75,37 @@ def _strip_classical_bits(circ: QuantumCircuit) -> QuantumCircuit:
         new.append(inst, qargs)
     return new
 
+
+def _fast_partition_plan(circ: QuantumCircuit, max_local: int, *, num_samples: int, reason: str) -> PartitionPlan:
+    naive = _naive_chunk_partition(circ, max_local)
+    subcircuits = {lbl: sc for (lbl, sc) in naive}
+    subobservables = {lbl: [] for (lbl, _sc) in naive}
+    est_exec = max(1, len(subcircuits)) * max(1, int(num_samples or 1))
+    return PartitionPlan(
+        kind="qiskit_addon",
+        subcircuits=list(subcircuits.values()),
+        reconstruction={
+            "subexperiments": {},
+            "coefficients": {},
+            "subobservables": subobservables,
+            "meta": {"approx_only": True, "fallback": reason},
+        },
+        est_executions=int(est_exec),
+        k_wire=0,
+        k_gate=0,
+    )
+
+
 class QiskitAddonCutStrategy(CutStrategy):
-    """Baseline strategy using qiskit-addon-cutting (add-on v0.10.x).
-
-    Core API used:
-      - find_cuts(circuit, OptimizationParameters, DeviceConstraints)
-      - cut_wires, expand_observables
-      - partition_problem
-      - generate_cutting_experiments
-      - reconstruct_expectation_values
-    """
-
     name = "qiskit_addon"
 
-    def __init__(self, num_samples: int = 200, seed: Optional[int] = None, max_gamma: float = 1024.0, max_backjumps: Optional[int] = 10000):
+    def __init__(
+        self,
+        num_samples: int = 200,
+        seed: Optional[int] = None,
+        max_gamma: float = 1024.0,
+        max_backjumps: Optional[int] = 10000,
+    ):
         self.num_samples = int(num_samples)
         self.seed = seed
         self.max_gamma = float(max_gamma)
@@ -103,20 +115,42 @@ class QiskitAddonCutStrategy(CutStrategy):
         import qiskit_addon_cutting as cutting
         return cutting
 
-
     def analyze(self, circuit: QuantumCircuit, constraints: CutConstraints, context: Dict[str, Any]) -> CutAnalysis:
-        """Fast feasibility + overhead analysis for planner.
-
-        Returns a CutAnalysis. Does *not* generate full subexperiments
-        """
         t0 = time.perf_counter()
         circ = _strip_classical_bits(circuit)
-        max_local = context.get("max_local_qubits", None)
-        if max_local is not None and circ.num_qubits <= int(max_local):
-            return CutAnalysis(feasible=True, reason="fits_without_cutting", est_executions=1, est_quality_delta=0.0, est_search_time_s=0.0)
+        max_local = int((context or {}).get("max_local_qubits", 0) or 0)
+
+        if max_local and circ.num_qubits <= max_local:
+            return CutAnalysis(
+                feasible=True,
+                reason="fits_without_cutting",
+                est_executions=1,
+                est_quality_delta=0.0,
+                est_search_time_s=time.perf_counter() - t0,
+            )
 
         if constraints.max_cuts <= 0:
-            return CutAnalysis(feasible=False, reason="max_cuts=0", est_search_time_s=0.0)
+            return CutAnalysis(feasible=False, reason="max_cuts=0", est_search_time_s=time.perf_counter() - t0)
+
+        # Critical fix: in analytic/planner mode, do not call find_cuts at all.
+        if (_QDC_CUT_FAST_PARTITION or (context or {}).get("approx_only", False)) and max_local > 0:
+            if circ.num_qubits > max_local:
+                n_parts = math.ceil(circ.num_qubits / max_local)
+                est_exec = max(1, n_parts * max(1, int(self.num_samples or 1)))
+                return CutAnalysis(
+                    feasible=True,
+                    reason="approx_chunk_feasible",
+                    est_executions=int(est_exec),
+                    est_quality_delta=None,
+                    est_search_time_s=time.perf_counter() - t0,
+                )
+            return CutAnalysis(
+                feasible=True,
+                reason="approx_no_cut_needed",
+                est_executions=1,
+                est_quality_delta=0.0,
+                est_search_time_s=time.perf_counter() - t0,
+            )
 
         try:
             cutting = self._import_addon()
@@ -136,18 +170,12 @@ class QiskitAddonCutStrategy(CutStrategy):
             best_meta = None
             target = getattr(constraints, "target_labels", None)
             seed_tries = max(1, int(getattr(constraints, "seed_tries", 1) or 1))
-            max_local = int(context.get("max_local_qubits", 0) or 0)
 
-            # minimal observable placeholder is fine for label count estimate; planner only needs feasibility + overhead
-            observables = context.get("observable", None)
+            observables = (context or {}).get("observable", None)
             if observables is not None:
                 observables = [_to_paulilist(o) for o in observables]
             if observables is None:
-                # Z gate on first qubit for compatibility
                 observables = [PauliList(["Z" + "I" * (circ.num_qubits - 1)])]
-
-            observables = [_to_paulilist(o) for o in observables]
-            # If caller provided a list of SparsePauliOp/strings, coerce them for add-on APIs.
 
             for _name, gate_lo, wire_lo in modes:
                 for k in range(seed_tries):
@@ -165,7 +193,6 @@ class QiskitAddonCutStrategy(CutStrategy):
                         continue
                     overhead = float(meta.get("sampling_overhead", math.inf))
 
-                    # Optional: estimate label count to match target_labels
                     num_labels = None
                     if target is not None:
                         try:
@@ -185,18 +212,40 @@ class QiskitAddonCutStrategy(CutStrategy):
                 return CutAnalysis(feasible=False, reason="no_cut_solution_within_constraints", est_search_time_s=time.perf_counter() - t0)
 
             overhead = float(best_meta.get("sampling_overhead", math.inf))
-            # Map overhead to a rough execution multiplier: higher overhead => more subexperiments
             est_exec = int(max(1, round(overhead))) if math.isfinite(overhead) else None
-            return CutAnalysis(feasible=True, reason="cut_feasible", est_executions=est_exec, est_quality_delta=None, est_search_time_s=time.perf_counter() - t0)
-
+            return CutAnalysis(
+                feasible=True,
+                reason="cut_feasible",
+                est_executions=est_exec,
+                est_quality_delta=None,
+                est_search_time_s=time.perf_counter() - t0,
+            )
         except Exception as e:
             return CutAnalysis(feasible=False, reason=f"analyze_error:{repr(e)}", est_search_time_s=time.perf_counter() - t0)
 
     def partition(self, circuit: QuantumCircuit, constraints: CutConstraints, context: Dict[str, Any]) -> PartitionPlan:
-        """Build the full partition plan + subexperiments + reconstruction payload."""
         circ = _strip_classical_bits(circuit)
-        max_local = int(context.get("max_local_qubits", circ.num_qubits) or circ.num_qubits)
-        observables = _coerce_observables(context.get("observable", None), circ.num_qubits)
+        ctx = context or {}
+        max_local = int(ctx.get("max_local_qubits", circ.num_qubits) or circ.num_qubits)
+        observables = _coerce_observables(ctx.get("observable", None), circ.num_qubits)
+
+        # Critical fix: fast/approximate planning must bypass find_cuts entirely.
+        if (_QDC_CUT_FAST_PARTITION or ctx.get("approx_only", False)) and _QDC_CUT_FALLBACK_PARTITION and max_local > 0:
+            if circ.num_qubits > max_local:
+                return _fast_partition_plan(circ, max_local, num_samples=self.num_samples, reason="naive_chunk")
+            return PartitionPlan(
+                kind="qiskit_addon",
+                subcircuits=[circ],
+                reconstruction={
+                    "subexperiments": {},
+                    "coefficients": {},
+                    "subobservables": {0: []},
+                    "meta": {"approx_only": True, "fallback": "single_chunk"},
+                },
+                est_executions=max(1, int(self.num_samples or 1)),
+                k_wire=0,
+                k_gate=0,
+            )
 
         try:
             cutting = self._import_addon()
@@ -259,39 +308,26 @@ class QiskitAddonCutStrategy(CutStrategy):
             subcircuits = prob.subcircuits
             subobservables = prob.subobservables
 
-            # Fallback (fast/approx only): if the cutting addon couldn't produce any subcircuits,
-            # create a simple contiguous-chunk partition so planning can still proceed.
-            if (not subcircuits) and (_QDC_CUT_FAST_PARTITION or context.get("approx_only", False)) and _QDC_CUT_FALLBACK_PARTITION:
-                max_subq = int(context.get("max_subcircuit_qubits", 0) or context.get("max_local_qubits", 0) or 0)
-                if max_subq > 0 and getattr(final_circ, "num_qubits", 0) > max_subq:
-                    naive = _naive_chunk_partition(final_circ, max_subq)
-                    subcircuits = {lbl: sc for (lbl, sc) in naive}
-                    subobservables = {lbl: [] for (lbl, _) in naive}
+            if (not subcircuits) and _QDC_CUT_FALLBACK_PARTITION and max_local > 0 and getattr(final_circ, "num_qubits", 0) > max_local:
+                naive = _naive_chunk_partition(final_circ, max_local)
+                subcircuits = {lbl: sc for (lbl, sc) in naive}
+                subobservables = {lbl: [] for (lbl, _sc) in naive}
 
-
-            if _QDC_CUT_FAST_PARTITION or context.get("approx_only", False):
-                subexperiments, coefficients = {}, {}
-            else:
-                subexperiments, coefficients = cutting.generate_cutting_experiments(
-                    subcircuits, subobservables, num_samples=self.num_samples
-                )
+            subexperiments, coefficients = cutting.generate_cutting_experiments(
+                subcircuits, subobservables, num_samples=self.num_samples
+            )
             if isinstance(subexperiments, dict):
                 est_exec = sum(len(v) for v in subexperiments.values())
-                if est_exec == 0 and (_QDC_CUT_FAST_PARTITION or context.get("approx_only", False)):
-                    # rough proxy: each subcircuit gets `num_samples` QPD samples (or 1 if unset)
-                    ns = int(getattr(self, "num_samples", 1) or 1)
-                    est_exec = max(1, len(subcircuits)) * ns
             else:
                 est_exec = len(subexperiments)
-
-
 
             k_wire = 0
             k_gate = 0
             for ctype, _cid in (best_meta.get("cuts", []) if isinstance(best_meta, dict) else []):
-                if "wire" in str(ctype).lower():
+                ctype_s = str(ctype).lower()
+                if "wire" in ctype_s:
                     k_wire += 1
-                elif "gate" in str(ctype).lower():
+                elif "gate" in ctype_s:
                     k_gate += 1
 
             return PartitionPlan(

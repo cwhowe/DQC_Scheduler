@@ -73,7 +73,6 @@ def _parse_int_list(env_name: str, default_csv: str) -> List[int]:
 
 
 
-
 def _parse_float_list(env_name: str, default_csv: str) -> List[float]:
     raw = os.getenv(env_name, default_csv)
     out: List[float] = []
@@ -120,17 +119,12 @@ def _planned_wide_submit_times(n_wide: int, rng: random.Random) -> List[float]:
     times.sort()
     return times
 
+
 def make_workload(
     n_jobs: int | None = None,
     pct_expect: float | None = None,
     pct_wide: float | None = None,
 ) -> Tuple[List[Tuple[float, Job]], Set[str]]:
-    """Generate a mixed workload.
-
-    - Counts jobs (random CX circuits) always fit.
-    - Expectation jobs use GHZ without measurement + Z^{\otimes n} observable.
-    - A small fraction are "wide slots" which can exceed any single QPU (to exercise cutting).
-    """
     if n_jobs is None:
         n_jobs = int(os.getenv("QDC_N_JOBS", "160"))
     if pct_expect is None:
@@ -157,7 +151,6 @@ def make_workload(
         t += rng.choice([0.0, 0.1, 0.2, 0.5, 1.0])
         jid = f"J{i:03d}"
 
-        # Wide-slot jobs: expectation circuits designed to stress the cut/distribute decision.
         if i in wide_slots:
             width = rng.choice(wide_widths)
             shots = rng.choice(wide_shots)
@@ -301,10 +294,7 @@ def _print_histogram(ctr: Counter) -> None:
 
 
 def _export_results(sched: Scheduler, outdir: str) -> None:
-    """Export scheduler metrics + task log to CSVs."""
     os.makedirs(outdir, exist_ok=True)
-
-    # ---- records.csv ----
     records = []
     try:
         records = getattr(getattr(sched, "metrics", None), "records", []) or []
@@ -338,7 +328,6 @@ def _export_results(sched: Scheduler, outdir: str) -> None:
                 "details_json": json.dumps(getattr(r, "details", {}) or {}, default=str),
             })
 
-    # ---- events.csv ----
     events = []
     try:
         events = getattr(sched, "task_log", []) or []
@@ -367,6 +356,17 @@ def _export_results(sched: Scheduler, outdir: str) -> None:
             })
 
     print(f"[EXPORT] wrote {rec_path} and {evt_path}")
+
+
+def _active_reservations(qpus: Dict[str, QPUState], now_s: float) -> int:
+    total = 0
+    for st in qpus.values():
+        try:
+            active = getattr(st, "active_reservations", []) or []
+            total += sum(1 for r in active if float(getattr(r, "end_s", 0.0)) > float(now_s))
+        except Exception:
+            continue
+    return total
 
 
 def run_workload(full_eval: bool = False) -> None:
@@ -431,6 +431,7 @@ def run_workload(full_eval: bool = False) -> None:
     max_to_schedule = int(os.getenv("QDC_MAX_TO_SCHEDULE", "2"))
 
     step_wall_cap_s = float(os.getenv("QDC_STEP_WALL_CAP_S", "15.0"))
+    idle_break_steps = int(os.getenv("QDC_IDLE_BREAK_STEPS", "5"))
 
     for step in range(max_steps):
         while next_idx < len(wl) and wl[next_idx][0] <= now + 1e-12:
@@ -461,29 +462,35 @@ def run_workload(full_eval: bool = False) -> None:
         else:
             idle_steps += 1
 
+        pending = sched.pending_count()
+        active_res = _active_reservations(qpus, now)
+
+        if next_idx >= len(wl) and pending == 0 and active_res == 0:
+            stop_reason = "all_jobs_completed_and_no_active_reservations"
+            break
+
+        if next_idx >= len(wl) and pending == 0 and idle_steps >= idle_break_steps:
+            stop_reason = f"idle_break_after_completion({idle_break_steps})"
+            break
+
         dt = 0.5 if started else (max(0.5, float(wl[next_idx][0] - now)) if next_idx < len(wl) else 1.0)
         sched.tick(dt)
         now += dt
 
         if step % 5 == 0:
-            qlen = len(getattr(sched, "queue", []))
-            pend = len(getattr(sched, "_pending", []))
-            print(f"[t={now:7.2f}] reserve_calls={dict(reserve_counts)} | queue={qlen} pending={pend}")
-
-        if next_idx >= len(wl):
-            qlen = len(getattr(sched, "queue", []))
-            pend = len(getattr(sched, "_pending", []))
-            if qlen == 0 and pend == 0 and idle_steps >= 300:
-                break
+            print(
+                f"[t={now:7.2f}] reserve_calls={dict(reserve_counts)} | "
+                f"pending={pending} active_res={active_res}"
+            )
 
     else:
         if stop_reason is None:
             stop_reason = "max_steps reached"
 
     completed = len(getattr(sched.metrics, "records", [])) if hasattr(sched, "metrics") else 0
-    qlen = len(getattr(sched, "queue", []))
-    pend = len(getattr(sched, "_pending", []))
-    print(f"[DEMO] completed={completed} / total_jobs={len(wl)} submitted={next_idx} queue={qlen} pending={pend}")
+    pend = sched.pending_count()
+    active_res = _active_reservations(qpus, now)
+    print(f"[DEMO] completed={completed} / total_jobs={len(wl)} submitted={next_idx} pending={pend} active_res={active_res}")
     if stop_reason:
         print("[DEMO] stop_reason:", stop_reason)
 

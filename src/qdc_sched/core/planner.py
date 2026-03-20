@@ -76,6 +76,10 @@ class Planner:
         candidates: List[Plan] = []
         debug_scores = {}  # kind -> dict(pred_total, fid_proxy, score, slo_ok)
 
+        _planner_approx_partition = os.getenv("QDC_PLANNER_APPROX_PARTITION", "1") not in ("0", "false", "False")
+        _skip_plan_b_for_forced_wide = os.getenv("QDC_SKIP_PLAN_B_FOR_FORCED_WIDE", "1") not in ("0", "false", "False")
+        _debug_plan_b = os.getenv("QDC_DEBUG_PLAN_B", "0") == "1"
+
         def _wait_s(qpu_id: str, need: int, at_s: float) -> float:
             """Estimate additional wait (beyond base_queue_delay_s) at a specific time.
 
@@ -127,10 +131,14 @@ class Planner:
             cap = st.max_connected_free_qubits(now_s)
             if cap > 1:
                 fid_proxy = self.quality.fidelity_proxy_from_profile(qpu_id, prof)
-                pred_t = float(ranked_qpus[0][2]) if ranked_qpus else 0.05
+                try:
+                    pred_t = float(predict_exec_time_s(st.profile, prof, shots=job.shots))
+                except Exception:
+                    pred_t = 0.05
                 cut_qpu_pool.append((qpu_id, pred_t, float(fid_proxy), int(cap)))
 
         candidates_qpus = [q for (q, _pt, _fp, _cap) in cut_qpu_pool]
+        max_single_free = max((int(cap) for (_q, _pt, _fp, cap) in cut_qpu_pool), default=0)
         if not candidates_qpus:
             candidates_qpus = [q for (q, *_rest) in ranked_qpus] if ranked_qpus else list(self.qpus.keys())
 
@@ -142,8 +150,19 @@ class Planner:
         # -----------------
         # Plan B: cut, single QPU sequential
         # -----------------
-        if allow_cut and not _budget_exceeded():
+        skip_plan_b = (
+            _skip_plan_b_for_forced_wide
+            and bool(getattr(job.constraints, 'force_cutting', False))
+            and bool(getattr(job.constraints, 'allow_multi_qpu', False))
+            and int(getattr(prof, 'width', 0) or 0) > int(max_single_free)
+        )
+        if allow_cut and skip_plan_b and _debug_plan_b:
+            print(f"[PLAN-B-SKIP] job={job.job_id} reason=forced_wide_prefers_multi width={int(getattr(prof, 'width', 0) or 0)} max_single_free={int(max_single_free)}")
+
+        if allow_cut and (not skip_plan_b) and not _budget_exceeded():
             for (qpu_id, _pred_t, fid_proxy, max_local) in cut_qpu_pool:
+                if _budget_exceeded():
+                    break
                 cc0 = self.cfg.cut_constraints
                 tl_raw = getattr(cc0, "target_labels", None)
                 tl0 = 2 if (tl_raw is None) else int(tl_raw)
@@ -167,10 +186,14 @@ class Planner:
                 )
                 # Partition once (FitCut search is lightweight with caps. this makes time/labels explicit)
                 part = None
+                if _debug_plan_b:
+                    print(f"[PLAN-B-TRY] job={job.job_id} qpu={qpu_id} max_local={max_local} target_labels={chosen_labels} approx={_planner_approx_partition}")
                 try:
                     with _qdc_time_limit(_cut_timeout_s):
-                        part = self.cfg.cut_strategy.partition(job.circuit, cc, {"max_local_qubits": max_local, "qpu_candidates": [qpu_id]})
+                        part = self.cfg.cut_strategy.partition(job.circuit, cc, {"max_local_qubits": max_local, "qpu_candidates": [qpu_id], "approx_only": _planner_approx_partition, "observable": getattr(job, "observables", None)})
                 except TimeoutError:
+                    if _debug_plan_b:
+                        print(f"[PLAN-B-SKIP] job={job.job_id} qpu={qpu_id} reason=cut_timeout timeout_s={_cut_timeout_s}")
                     part = None
                 except Exception as e:
                     if os.getenv("QDC_DEBUG_CUT_ERRORS", "0") == "1":
@@ -180,7 +203,13 @@ class Planner:
                     continue
                 if (part is None) or (not part.subcircuits):
                     continue
-                sub_profiles = [profile_circuit(sc) for sc in part.subcircuits]
+                sub_profiles = []
+                for sc in part.subcircuits:
+                    if _budget_exceeded():
+                        break
+                    sub_profiles.append(profile_circuit(sc))
+                if len(sub_profiles) != len(part.subcircuits):
+                    break
                 base_time = sum(predict_exec_time_s(self.qpus[qpu_id].profile, sp, shots=job.shots) for sp in sub_profiles)
                 sampling = float(part.est_executions or 1.0)
                 recon_base = float(getattr(self.qpus[qpu_id].profile, 'reconstruction_base_s', 0.0) or 0.0)
@@ -212,10 +241,12 @@ class Planner:
                         "pred_comm_s": float(pred_comm),
                         "labels_used": len(part.subcircuits),
                         "recon_est_s": pred_recon,
-                        "k_wire": int(part.k_wire),
-                        "k_gate": int(part.k_gate),
+                        "k_wire": int(getattr(part, "k_wire", 0) or 0),
+                        "k_gate": int(getattr(part, "k_gate", 0) or 0),
                         "qpu_candidates": [qpu_id],
                         "max_local_qubits": int(max_local),
+                        "target_labels": int(chosen_labels),
+                        "partition_subcircuits": list(getattr(part, "subcircuits", []) or []),
                     },
                 ))
 
@@ -223,31 +254,40 @@ class Planner:
         # -----------------
         # Plan C: cut, multi-QPU parallel
         # -----------------
+
         if allow_cut and job.constraints.allow_multi_qpu and len(cut_qpu_pool) >= 2 and not _budget_exceeded():
             all_candidates_qpus = [c[0] for c in cut_qpu_pool]
             cc0 = self.cfg.cut_constraints
             tl_raw = getattr(cc0, 'target_labels', None)
             tl0 = 2 if (tl_raw is None) else int(tl_raw)
             allow_pack = os.getenv('QDC_C_ALLOW_PACK_LABELS', '1') not in ('0', 'false', 'False')
+            debug_c = os.getenv("QDC_DEBUG_PLAN_C", "0") == "1"
+            max_exact_labels = int(os.getenv("QDC_C_EXACT_PACK_MAX_LABELS", "8"))
+            max_exact_states = int(os.getenv("QDC_C_EXACT_PACK_MAX_STATES", "256"))
+            max_c_subsets = int(os.getenv("QDC_C_MAX_SUBSETS", "8"))
 
-            # Score Plan C on concrete multi-QPU subsets instead of one partition built against
-            # the entire pool. Otherwise the smallest QPU in the whole pool can force over-cutting
-            # even when a better pair (e.g. B+C) exists.
+            # Score only 2-QPU pairs. This keeps planning bounded and makes C compare
+            # cleanly as A+B, A+C, B+C instead of exploring larger subsets.
             seen_subset_sig = set()
             subset_list = []
-
-            # For now, score only 2-QPU distributed plans so C compares cleanly as:
-            # A+B, A+C, B+C
             for subset in itertools.combinations(all_candidates_qpus, 2):
                 sig = tuple(sorted(subset))
                 if sig in seen_subset_sig:
                     continue
                 seen_subset_sig.add(sig)
                 subset_list.append(list(subset))
+            subset_list = subset_list[:max(1, max_c_subsets)]
 
             for candidates_qpus in subset_list:
+                if _budget_exceeded():
+                    if debug_c:
+                        print(f"[PLAN-C-SKIP] job={job.job_id} pair={candidates_qpus} reason=planner_budget_exceeded")
+                    break
+
                 max_local = min(int(self.qpus[qid].max_connected_free_qubits(now_s)) for qid in candidates_qpus)
                 if max_local <= 0:
+                    if debug_c:
+                        print(f"[PLAN-C-SKIP] job={job.job_id} pair={candidates_qpus} reason=no_free_capacity max_local={max_local}")
                     continue
 
                 needed_labels = max(tl0, int(math.ceil(float(prof.width) / float(max_local))))
@@ -268,35 +308,83 @@ class Planner:
                         part = self.cfg.cut_strategy.partition(
                             job.circuit,
                             cc,
-                            {"max_local_qubits": max_local, "qpu_candidates": candidates_qpus},
+                            {"max_local_qubits": max_local, "qpu_candidates": candidates_qpus, "approx_only": _planner_approx_partition, "observable": getattr(job, "observables", None)},
                         )
                 except TimeoutError:
+                    if debug_c:
+                        print(
+                            f"[PLAN-C-SKIP] job={job.job_id} pair={candidates_qpus} "
+                            f"reason=cut_timeout timeout_s={_cut_timeout_s} max_local={max_local} "
+                            f"needed_labels={needed_labels}"
+                        )
                     part = None
                 except Exception as e:
-                    if os.getenv("QDC_DEBUG_CUT_ERRORS", "0") == "1":
-                        print(f"[CUT-ERR] job={job.job_id} qpus={candidates_qpus} err={e}")
+                    if debug_c or os.getenv("QDC_DEBUG_CUT_ERRORS", "0") == "1":
+                        print(f"[PLAN-C-SKIP] job={job.job_id} pair={candidates_qpus} reason=cut_error err={e}")
                     part = None
 
                 if part is None:
                     continue
-                if (not getattr(part, 'subcircuits', None)) or (len(part.subcircuits) < int(needed_labels)):
+
+                if not getattr(part, 'subcircuits', None):
+                    if debug_c:
+                        print(f"[PLAN-C-SKIP] job={job.job_id} pair={candidates_qpus} reason=no_subcircuits")
+                    continue
+
+                if len(part.subcircuits) < int(needed_labels):
+                    if debug_c:
+                        print(
+                            f"[PLAN-C-SKIP] job={job.job_id} pair={candidates_qpus} "
+                            f"reason=too_few_labels got={len(part.subcircuits)} needed={needed_labels}"
+                        )
                     continue
 
                 labels = list(range(len(part.subcircuits)))
-                sub_profiles = [profile_circuit(sc) for sc in part.subcircuits]
+                sub_profiles = []
+                for sc in part.subcircuits:
+                    if _budget_exceeded():
+                        break
+                    sub_profiles.append(profile_circuit(sc))
+                if len(sub_profiles) != len(part.subcircuits):
+                    if debug_c:
+                        print(f"[PLAN-C-SKIP] job={job.job_id} pair={candidates_qpus} reason=planner_budget_during_profile")
+                    break
+
                 label_costs = {i: float(sp.twoq_count + 0.2 * sp.oneq_count) for i, sp in enumerate(sub_profiles)}
                 label_qpu_pred_time = {i: {} for i in labels}
                 for i, sp in enumerate(sub_profiles):
+                    if _budget_exceeded():
+                        break
                     for qid in candidates_qpus:
                         label_qpu_pred_time[i][qid] = predict_exec_time_s(self.qpus[qid].profile, sp, shots=job.shots)
+                if any(len(v) != len(candidates_qpus) for v in label_qpu_pred_time.values()):
+                    if debug_c:
+                        print(f"[PLAN-C-SKIP] job={job.job_id} pair={candidates_qpus} reason=planner_budget_during_pred_time")
+                    break
 
                 qpu_caps = {qid: int(self.qpus[qid].max_connected_free_qubits(now_s)) for qid in candidates_qpus}
                 qpu_quality = {qid: float(self.quality.fidelity_proxy_from_profile(qid, prof)) for qid in candidates_qpus}
                 qpu_pred_time = {qid: float(self.qpus[qid].profile.base_queue_delay_s or 0.0) for qid in candidates_qpus}
 
-                if allow_pack:
+                n_labels = len(labels)
+                n_qpus = len(candidates_qpus)
+                search_states = n_qpus ** n_labels
+                use_exact_pack = allow_pack and n_labels <= max_exact_labels and search_states <= max_exact_states
+
+                if debug_c:
+                    print(
+                        f"[PLAN-C-INFO] job={job.job_id} pair={candidates_qpus} "
+                        f"needed_labels={needed_labels} got_labels={len(part.subcircuits)} "
+                        f"search_states={search_states} exact_pack={use_exact_pack}"
+                    )
+
+                if use_exact_pack:
                     best_assign = None  # (makespan, total, assignment, used_qpus)
-                    for choice in itertools.product(candidates_qpus, repeat=len(labels)):
+                    for choice in itertools.product(candidates_qpus, repeat=n_labels):
+                        if _budget_exceeded():
+                            if debug_c:
+                                print(f"[PLAN-C-SKIP] job={job.job_id} pair={candidates_qpus} reason=planner_budget_during_pack")
+                            break
                         used = set(choice)
                         if len(used) < 2:
                             continue
@@ -309,6 +397,8 @@ class Planner:
                         if best_assign is None or cand[:2] < best_assign[:2]:
                             best_assign = cand
                     if best_assign is None:
+                        if debug_c:
+                            print(f"[PLAN-C-SKIP] job={job.job_id} pair={candidates_qpus} reason=no_valid_exact_assignment")
                         continue
                     makespan, _total, assignment, used_qpus = best_assign
                 else:
@@ -324,12 +414,13 @@ class Planner:
                     )
                     used_qpus = set(assignment.values())
                     if len(used_qpus) < 2:
+                        if debug_c:
+                            print(f"[PLAN-C-SKIP] job={job.job_id} pair={candidates_qpus} reason=assignment_not_multi_qpu")
                         continue
                     loads = {q: 0.0 for q in used_qpus}
                     for lab, q in assignment.items():
                         loads[q] += float(label_qpu_pred_time[lab][q])
                     makespan = max(loads.values()) if loads else float('inf')
-
                 sampling = float(part.est_executions or 1.0)
                 per_qpu_wait_s = {}
                 for qid in used_qpus:
@@ -360,6 +451,14 @@ class Planner:
                 pred_total = float(pred_finish) + pred_comm + pred_recon
                 fid_proxy = max(float(self.quality.fidelity_proxy_from_profile(qid, prof)) for qid in used_qpus_list)
 
+                if debug_c:
+                    print(
+                        f"[PLAN-C-CAND] job={job.job_id} pair={candidates_qpus} used={used_qpus_list} "
+                        f"labels={len(labels)} sampling={sampling:.3f} "
+                        f"pred_queue={pred_queue:.6f} pred_exec={pred_exec:.6f} "
+                        f"pred_comm={pred_comm:.6f} pred_recon={pred_recon:.6f} total={pred_total:.6f}"
+                    )
+
                 candidates.append(Plan(
                     kind="C_CUT_MULTI_QPU",
                     qpu_id=None,
@@ -380,14 +479,15 @@ class Planner:
                         "predicted_makespan_s": float(pred_exec),
                         "wait_est_s": float(pred_queue),
                         "per_qpu_wait_s": dict(per_qpu_wait_s),
-                        "k_wire": int(part.k_wire),
-                        "k_gate": int(part.k_gate),
+                        "k_wire": int(getattr(part, "k_wire", 0) or 0),
+                        "k_gate": int(getattr(part, "k_gate", 0) or 0),
                         "assignment": assignment,
                         "assignment_preview": assignment,
+                        "max_local_qubits": int(max_local),
+                        "target_labels": int(chosen_labels),
+                        "partition_subcircuits": list(getattr(part, "subcircuits", []) or []),
                     },
                 ))
-
-
         # -----------------
         # Score + SLO filter
         # -----------------
