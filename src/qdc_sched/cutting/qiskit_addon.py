@@ -132,7 +132,7 @@ class QiskitAddonCutStrategy(CutStrategy):
         if constraints.max_cuts <= 0:
             return CutAnalysis(feasible=False, reason="max_cuts=0", est_search_time_s=time.perf_counter() - t0)
 
-        # Critical fix: in analytic/planner mode, do not call find_cuts at all.
+        # In analytic/planner mode, do not call find_cuts at all
         if (_QDC_CUT_FAST_PARTITION or (context or {}).get("approx_only", False)) and max_local > 0:
             if circ.num_qubits > max_local:
                 n_parts = math.ceil(circ.num_qubits / max_local)
@@ -229,7 +229,7 @@ class QiskitAddonCutStrategy(CutStrategy):
         max_local = int(ctx.get("max_local_qubits", circ.num_qubits) or circ.num_qubits)
         observables = _coerce_observables(ctx.get("observable", None), circ.num_qubits)
 
-        # Critical fix: fast/approximate planning must bypass find_cuts entirely.
+        # fast/approximate planning must bypass find_cuts entirely
         if (_QDC_CUT_FAST_PARTITION or ctx.get("approx_only", False)) and _QDC_CUT_FALLBACK_PARTITION and max_local > 0:
             if circ.num_qubits > max_local:
                 return _fast_partition_plan(circ, max_local, num_samples=self.num_samples, reason="naive_chunk")

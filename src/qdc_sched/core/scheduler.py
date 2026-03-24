@@ -222,12 +222,18 @@ class Scheduler:
         if plan.kind != "D_WAIT":
             out, rec = self.executor.run_job_plan(job, plan, self.now_s, toggles)
             rec.t_schedule_s = (t_sched1 - t_sched0)
-            rec.end_to_end_s = (time.perf_counter() - t_sched0)
 
             try:
                 if rec.details is None or not isinstance(rec.details, dict):
                     rec.details = {}
+                rec.details["schedule_wall_s"] = float(t_sched1 - t_sched0)
                 rec.details.setdefault("queue_wait_s", max(0.0, self.now_s - float(job.submit_time_s)))
+                if "sim_queue_wait_s" in rec.details:
+                    rec.details["queue_wait_s"] = float(rec.details.get("sim_queue_wait_s", 0.0) or 0.0)
+                if "sim_latency_s" in rec.details:
+                    rec.end_to_end_s = float(rec.details.get("sim_latency_s", 0.0) or 0.0)
+                else:
+                    rec.end_to_end_s = max(0.0, float(rec.details.get("sim_result_ready_time_s", self.now_s)) - float(job.submit_time_s))
             except Exception:
                 pass
 
@@ -406,13 +412,20 @@ class Scheduler:
 
             rec.t_schedule_s = (t_sched1 - t_sched0)
             self._maybe_log_tasks_from_record(rec)
-            rec.end_to_end_s = (time.perf_counter() - t_sched0)
 
             try:
                 if rec.details is None or not isinstance(rec.details, dict):
                     rec.details = {}
-                rec.details["queue_wait_s"] = max(0.0, self.now_s - float(it.job.submit_time_s))
+                rec.details["schedule_wall_s"] = float(t_sched1 - t_sched0)
                 rec.details["pending_attempts"] = int(it.attempts)
+                rec.details["pending_enqueue_time_s"] = float(getattr(it, "enqueue_time_s", self.now_s))
+                rec.details.setdefault("queue_wait_s", max(0.0, self.now_s - float(it.job.submit_time_s)))
+                if "sim_queue_wait_s" in rec.details:
+                    rec.details["queue_wait_s"] = float(rec.details.get("sim_queue_wait_s", 0.0) or 0.0)
+                if "sim_latency_s" in rec.details:
+                    rec.end_to_end_s = float(rec.details.get("sim_latency_s", 0.0) or 0.0)
+                else:
+                    rec.end_to_end_s = max(0.0, float(rec.details.get("sim_result_ready_time_s", self.now_s)) - float(it.job.submit_time_s))
             except Exception:
                 pass
 

@@ -685,6 +685,27 @@ class Executor:
 
         details = _ensure_taskgraph(details, job.job_id, tasks2)
 
+        # Simulation-time timing fields derived from the task graph.
+        all_tasks = list(tasks2 or [])
+        q_tasks = [t for t in all_tasks if getattr(t, "kind", None) == "quantum"]
+        sim_first_task_start_s = float(min((float(getattr(t, "start_s", now_s)) for t in all_tasks), default=float(now_s)))
+        sim_last_task_end_s = float(max((float(getattr(t, "end_s", now_s)) for t in all_tasks), default=float(now_s)))
+        sim_first_quantum_start_s = float(min((float(getattr(t, "start_s", now_s)) for t in q_tasks), default=sim_first_task_start_s))
+        sim_last_quantum_end_s = float(max((float(getattr(t, "end_s", now_s)) for t in q_tasks), default=sim_last_task_end_s))
+        sim_queue_wait_s = max(0.0, sim_first_task_start_s - float(getattr(job, "submit_time_s", 0.0) or 0.0))
+        sim_execution_span_s = max(0.0, sim_last_quantum_end_s - sim_first_quantum_start_s) if q_tasks else 0.0
+        sim_result_ready_time_s = sim_last_task_end_s
+        sim_latency_s = max(0.0, sim_result_ready_time_s - float(getattr(job, "submit_time_s", 0.0) or 0.0))
+
+        details["sim_first_task_start_s"] = sim_first_task_start_s
+        details["sim_last_task_end_s"] = sim_last_task_end_s
+        details["sim_first_quantum_start_s"] = sim_first_quantum_start_s
+        details["sim_last_quantum_end_s"] = sim_last_quantum_end_s
+        details["sim_result_ready_time_s"] = sim_result_ready_time_s
+        details["sim_queue_wait_s"] = sim_queue_wait_s
+        details["sim_execution_span_s"] = sim_execution_span_s
+        details["sim_latency_s"] = sim_latency_s
+
         rec = JobRunRecord(
             job_id=job.job_id,
             qpu_id=(plan.qpu_id if plan.qpu_id is not None else ("MULTI" if plan.kind == "C_CUT_MULTI_QPU" else None)),
@@ -695,7 +716,7 @@ class Executor:
             t_mapping_s=0.0,
             t_execution_s=float(t_exec_model),
             t_reconstruction_s=float(t_recon_model),
-            end_to_end_s=float(t1_wall - t0_wall),
+            end_to_end_s=float(sim_latency_s),
             fidelity_proxy=getattr(plan, "predicted_fidelity_proxy", None),
             fidelity_estimated=None,
             details=details,
@@ -710,11 +731,12 @@ class Executor:
 
         timing_wall["execute_s"] = float(details.get("wall_exec_s", 0.0) or 0.0)
         timing_wall["reconstruct_s"] = float(details.get("wall_recon_s", 0.0) or 0.0)
-        timing_wall["total_s"] = float(rec.end_to_end_s)
+        timing_wall["total_s"] = float(t1_wall - t0_wall)
         rem = timing_wall["total_s"] - timing_wall["execute_s"] - timing_wall["reconstruct_s"]
         timing_wall["postprocess_s"] = float(rem) if rem > 0 else 0.0
 
         rec.details = _attach_timing_dicts(rec.details if isinstance(rec.details, dict) else {}, timing_model, timing_wall)
+        rec.details["wall_end_to_end_s"] = float(t1_wall - t0_wall)
         return rec
 
 
