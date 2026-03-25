@@ -65,6 +65,11 @@ class Planner:
         self.quality = quality
         self.cfg = cfg
 
+    def _predict_host_reconstruction_s(self, sampling: float) -> float:
+        base = float(os.getenv("QDC_HOST_RECON_BASE_S", "0.0") or 0.0)
+        per = float(os.getenv("QDC_HOST_RECON_PER_EXEC_S", "0.0") or 0.0)
+        return base + per * float(sampling)
+
     def choose_plan(self, job: Job, prof: CircuitProfile, now_s: float, ranked_qpus) -> Plan:
         _planner_budget_s = float(os.getenv("QDC_PLANNER_BUDGET_S", "1.0"))
         _cut_timeout_s = float(os.getenv("QDC_CUT_TIMEOUT_S", "0.5"))
@@ -212,9 +217,7 @@ class Planner:
                     break
                 base_time = sum(predict_exec_time_s(self.qpus[qpu_id].profile, sp, shots=job.shots) for sp in sub_profiles)
                 sampling = float(part.est_executions or 1.0)
-                recon_base = float(getattr(self.qpus[qpu_id].profile, 'reconstruction_base_s', 0.0) or 0.0)
-                recon_per = float(getattr(self.qpus[qpu_id].profile, 'reconstruction_per_exec_s', 0.0) or 0.0)
-                recon_est = recon_base + recon_per * sampling
+                recon_est = self._predict_host_reconstruction_s(sampling)
                 max_width = max(int(sp.width) for sp in sub_profiles) if sub_profiles else int(prof.width)
                 base_delay = float(getattr(self.qpus[qpu_id].profile, 'base_queue_delay_s', 0.0) or 0.0)
                 start_probe_s = float(now_s) + float(base_delay)
@@ -435,10 +438,7 @@ class Planner:
                     q_load = sum(float(label_qpu_pred_time[lab][qid]) for lab, q in assignment.items() if q == qid)
                     pred_finish = max(pred_finish, float(per_qpu_wait_s.get(qid, 0.0)) + (q_load * sampling))
 
-                any_q = next(iter(used_qpus))
-                recon_base = float(getattr(self.qpus[any_q].profile, 'reconstruction_base_s', 0.0) or 0.0)
-                recon_per = float(getattr(self.qpus[any_q].profile, 'reconstruction_per_exec_s', 0.0) or 0.0)
-                recon_est = recon_base + recon_per * sampling
+                recon_est = self._predict_host_reconstruction_s(sampling)
 
                 used_qpus_list = sorted(list(used_qpus))
                 pred_comm = float(job.constraints.comm_overhead_s or 0.0) if len(used_qpus_list) >= 2 else 0.0

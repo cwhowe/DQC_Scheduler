@@ -21,7 +21,14 @@ from ..cutting import CutStrategy, FitCutCutStrategy, CutConstraints
 from ..cutting.assignment import MinMakespanGreedyAssignment
 
 def _timing_dict() -> dict:
-    return {"transpile_s": 0.0, "execute_s": 0.0, "reconstruct_s": 0.0, "postprocess_s": 0.0, "total_s": 0.0}
+    return {
+        "transpile_s": 0.0,
+        "execute_s": 0.0,
+        "communication_s": 0.0,
+        "reconstruct_s": 0.0,
+        "postprocess_s": 0.0,
+        "total_s": 0.0,
+    }
 
 
 def _attach_timing_dicts(details: dict, timing_model: dict, timing_wall: dict) -> dict:
@@ -33,6 +40,7 @@ def _attach_timing_dicts(details: dict, timing_model: dict, timing_wall: dict) -
         {
             "transpile_s": float(timing_wall.get("transpile_s", 0.0)),
             "execute_s": float(timing_model.get("execute_s", 0.0)),
+            "communication_s": float(timing_model.get("communication_s", 0.0)),
             "reconstruct_s": float(timing_model.get("reconstruct_s", 0.0)),
             "postprocess_s": float(timing_wall.get("postprocess_s", 0.0)),
             "total_measured_s": float(timing_wall.get("total_s", 0.0)),
@@ -657,37 +665,48 @@ class Executor:
         details.update(reserve_info or {})
         details.update(exec_extra or {})
 
-        # Model-facing execution/recon times
+        # Model-facing execution / communication / reconstruction times
         t_exec_model = 0.0
+        t_comm_model = 0.0
         t_recon_model = 0.0
+        q_only = [t for t in tasks if getattr(t, "kind", None) == "quantum"]
 
         if plan.kind == "A_NO_CUT_SINGLE":
             t_exec_model = float((plan.details or {}).get("pred_exec_time_s", 0.0) or 0.0)
         elif plan.kind == "B_CUT_SINGLE_SEQ":
-            # sum sequential quantum durations for model execution time
-            t_exec_model = float(_max_end_s([t for t in tasks if t.kind == "quantum"], default=0.0) - min((t.start_s for t in tasks if t.kind == "quantum"), default=0.0))
+            if q_only:
+                t_exec_model = float(
+                    max(float(t.end_s) for t in q_only) - min(float(t.start_s) for t in q_only)
+                )
             t_recon_model = float(details.get("recon_est_s", 0.0) or details.get("wall_recon_s", 0.0) or 0.0)
         elif plan.kind == "C_CUT_MULTI_QPU":
-            # makespan (parallel) + comm overhead for model execution
-            comm = float(getattr(job.constraints, "comm_overhead_s", 0.0) or 0.0) if getattr(job.constraints, "allow_multi_qpu", False) else 0.0
-            q_tasks = [t for t in tasks if t.kind == "quantum"]
-            makespan = 0.0
-            if q_tasks:
-                makespan = float(max(t.end_s for t in q_tasks) - min(t.start_s for t in q_tasks))
-            t_exec_model = makespan + comm
+            if q_only:
+                t_exec_model = float(
+                    max(float(t.end_s) for t in q_only) - min(float(t.start_s) for t in q_only)
+                )
+            t_comm_model = (
+                float(getattr(job.constraints, "comm_overhead_s", 0.0) or 0.0)
+                if getattr(job.constraints, "allow_multi_qpu", False)
+                else 0.0
+            )
             t_recon_model = float(details.get("recon_est_s", 0.0) or details.get("wall_recon_s", 0.0) or 0.0)
 
         # Append explicit COMM/RECON tasks using charged values
-        comm_over = 0.0
-        if plan.kind == "C_CUT_MULTI_QPU":
-            comm_over = float(getattr(job.constraints, "comm_overhead_s", 0.0) or 0.0) if getattr(job.constraints, "allow_multi_qpu", False) else 0.0
-        tasks2 = _append_comm_and_recon_tasks(tasks, job_id=job.job_id, plan_kind=plan.kind, comm_overhead_s=comm_over, recon_s=t_recon_model)
+        tasks2 = _append_comm_and_recon_tasks(
+            tasks,
+            job_id=job.job_id,
+            plan_kind=plan.kind,
+            comm_overhead_s=t_comm_model,
+            recon_s=t_recon_model,
+        )
 
         details = _ensure_taskgraph(details, job.job_id, tasks2)
 
         # Simulation-time timing fields derived from the task graph.
         all_tasks = list(tasks2 or [])
         q_tasks = [t for t in all_tasks if getattr(t, "kind", None) == "quantum"]
+        comm_tasks = [t for t in all_tasks if getattr(t, "kind", None) == "communication"]
+        recon_tasks = [t for t in all_tasks if getattr(t, "kind", None) == "reconstruction"]
         sim_first_task_start_s = float(min((float(getattr(t, "start_s", now_s)) for t in all_tasks), default=float(now_s)))
         sim_last_task_end_s = float(max((float(getattr(t, "end_s", now_s)) for t in all_tasks), default=float(now_s)))
         sim_first_quantum_start_s = float(min((float(getattr(t, "start_s", now_s)) for t in q_tasks), default=sim_first_task_start_s))
@@ -696,6 +715,12 @@ class Executor:
         sim_execution_span_s = max(0.0, sim_last_quantum_end_s - sim_first_quantum_start_s) if q_tasks else 0.0
         sim_result_ready_time_s = sim_last_task_end_s
         sim_latency_s = max(0.0, sim_result_ready_time_s - float(getattr(job, "submit_time_s", 0.0) or 0.0))
+        sim_comm_s = sum(max(0.0, float(t.end_s) - float(t.start_s)) for t in comm_tasks)
+        sim_recon_s = sum(max(0.0, float(t.end_s) - float(t.start_s)) for t in recon_tasks)
+        sim_submit_to_quantum_done_s = (
+            max(0.0, sim_last_quantum_end_s - float(getattr(job, "submit_time_s", 0.0) or 0.0))
+            if q_tasks else 0.0
+        )
 
         details["sim_first_task_start_s"] = sim_first_task_start_s
         details["sim_last_task_end_s"] = sim_last_task_end_s
@@ -705,6 +730,11 @@ class Executor:
         details["sim_queue_wait_s"] = sim_queue_wait_s
         details["sim_execution_span_s"] = sim_execution_span_s
         details["sim_latency_s"] = sim_latency_s
+        details["sim_comm_s"] = sim_comm_s
+        details["sim_recon_s"] = sim_recon_s
+        details["sim_submit_to_quantum_done_s"] = sim_submit_to_quantum_done_s
+        details["charged_comm_s"] = float(t_comm_model)
+        details["charged_recon_s"] = float(t_recon_model)
 
         rec = JobRunRecord(
             job_id=job.job_id,
@@ -726,8 +756,9 @@ class Executor:
         timing_model = _timing_dict()
         timing_wall = _timing_dict()
         timing_model["execute_s"] = float(rec.t_execution_s)
+        timing_model["communication_s"] = float(t_comm_model)
         timing_model["reconstruct_s"] = float(rec.t_reconstruction_s)
-        timing_model["total_s"] = float(rec.t_execution_s + rec.t_reconstruction_s)
+        timing_model["total_s"] = float(rec.t_execution_s + t_comm_model + rec.t_reconstruction_s)
 
         timing_wall["execute_s"] = float(details.get("wall_exec_s", 0.0) or 0.0)
         timing_wall["reconstruct_s"] = float(details.get("wall_recon_s", 0.0) or 0.0)
