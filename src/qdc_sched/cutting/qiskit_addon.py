@@ -76,8 +76,23 @@ def _strip_classical_bits(circ: QuantumCircuit) -> QuantumCircuit:
     return new
 
 
-def _fast_partition_plan(circ: QuantumCircuit, max_local: int, *, num_samples: int, reason: str) -> PartitionPlan:
-    naive = _naive_chunk_partition(circ, max_local)
+def _fast_partition_plan(
+    circ: QuantumCircuit,
+    max_local: int,
+    *,
+    num_samples: int,
+    reason: str,
+    target_labels: Optional[int] = None,
+) -> PartitionPlan:
+    n = int(getattr(circ, "num_qubits", 0) or 0)
+    if target_labels is not None and int(target_labels) >= 2 and n >= 2:
+        n_chunks = max(2, min(int(target_labels), n))
+        chunk_size = max(1, math.ceil(n / n_chunks))
+        naive = _naive_chunk_partition(circ, chunk_size)
+        if len(naive) < 2:
+            naive = _naive_chunk_partition(circ, max(1, n // 2))
+    else:
+        naive = _naive_chunk_partition(circ, max_local)
     subcircuits = {lbl: sc for (lbl, sc) in naive}
     subobservables = {lbl: [] for (lbl, _sc) in naive}
     est_exec = max(1, len(subcircuits)) * max(1, int(num_samples or 1))
@@ -134,6 +149,17 @@ class QiskitAddonCutStrategy(CutStrategy):
 
         # In analytic/planner mode, do not call find_cuts at all
         if (_QDC_CUT_FAST_PARTITION or (context or {}).get("approx_only", False)) and max_local > 0:
+            target = getattr(constraints, "target_labels", None)
+            if target is not None and int(target) >= 2:
+                n_parts = max(2, min(int(target), int(circ.num_qubits)))
+                est_exec = max(1, n_parts * max(1, int(self.num_samples or 1)))
+                return CutAnalysis(
+                    feasible=True,
+                    reason="approx_target_labels_feasible",
+                    est_executions=int(est_exec),
+                    est_quality_delta=None,
+                    est_search_time_s=time.perf_counter() - t0,
+                )
             if circ.num_qubits > max_local:
                 n_parts = math.ceil(circ.num_qubits / max_local)
                 est_exec = max(1, n_parts * max(1, int(self.num_samples or 1)))
@@ -231,8 +257,16 @@ class QiskitAddonCutStrategy(CutStrategy):
 
         # fast/approximate planning must bypass find_cuts entirely
         if (_QDC_CUT_FAST_PARTITION or ctx.get("approx_only", False)) and _QDC_CUT_FALLBACK_PARTITION and max_local > 0:
-            if circ.num_qubits > max_local:
-                return _fast_partition_plan(circ, max_local, num_samples=self.num_samples, reason="naive_chunk")
+            target = getattr(constraints, "target_labels", None)
+            if (target is not None and int(target) >= 2) or circ.num_qubits > max_local:
+                reason = "target_labels" if (target is not None and int(target) >= 2) else "naive_chunk"
+                return _fast_partition_plan(
+                    circ,
+                    max_local,
+                    num_samples=self.num_samples,
+                    reason=reason,
+                    target_labels=target,
+                )
             return PartitionPlan(
                 kind="qiskit_addon",
                 subcircuits=[circ],

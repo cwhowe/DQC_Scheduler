@@ -8,8 +8,8 @@ import pkgutil
 
 from qiskit_aer.noise import NoiseModel
 
+
 def _backend_id(b) -> str:
-    # Qiskit fake backends expose name() / backend_name
     if hasattr(b, "name"):
         try:
             return str(b.name())
@@ -22,13 +22,9 @@ def _backend_id(b) -> str:
             pass
     return b.__class__.__name__
 
-def _discover_fake_backends() -> List:
-    """Discover Fake backends from qiskit_ibm_runtime.fake_provider across versions.
 
-    We avoid relying on FakeProvider (which is missing in some qiskit-ibm-runtime builds)
-    by walking modules under qiskit_ibm_runtime.fake_provider and instantiating classes
-    named Fake* that look like Qiskit backends.
-    """
+def _discover_fake_backends() -> List:
+    """Discover Fake backends from qiskit_ibm_runtime.fake_provider across versions."""
     try:
         import qiskit_ibm_runtime.fake_provider as fp
     except Exception as e:
@@ -72,7 +68,6 @@ def _discover_fake_backends() -> List:
                 except Exception:
                     pass
 
-    # Deduplicate by backend id
     uniq: Dict[str, object] = {}
     for b in found:
         uniq[_backend_id(b)] = b
@@ -80,11 +75,7 @@ def _discover_fake_backends() -> List:
 
 
 def load_fake_backends(max_backends: int = 3, prefer: Optional[List[str]] = None):
-    """Load a set of IBM fake backends from qiskit-ibm-runtime.
-
-    If 'prefer' is provided, it is a list of substrings; backends whose names contain
-    those substrings are ranked earlier (case-insensitive).
-    """
+    """Load a set of IBM fake backends from qiskit-ibm-runtime."""
     backends = _discover_fake_backends()
     if not backends:
         raise ImportError(
@@ -103,18 +94,18 @@ def load_fake_backends(max_backends: int = 3, prefer: Optional[List[str]] = None
 
         backends.sort(key=key)
     else:
-        # If no preference, pick larger devices first to get diversity.
         def numq(b) -> int:
             try:
                 return int(b.configuration().num_qubits)
             except Exception:
                 return 0
+
         backends.sort(key=lambda b: (-numq(b), _backend_id(b)))
 
     return backends[: int(max_backends)]
 
+
 def build_aer_noise_models(fake_backends) -> Dict[str, NoiseModel]:
-    from qiskit_aer.noise import NoiseModel
     models = {}
     for b in fake_backends:
         try:
@@ -129,30 +120,11 @@ def build_aer_noise_models(fake_backends) -> Dict[str, NoiseModel]:
 # ---------------------------
 # Fallback local QPU set
 # ---------------------------
-from dataclasses import dataclass
 import networkx as nx
-
-def _make_line_graph(n: int) -> nx.Graph:
-    G = nx.Graph()
-    G.add_nodes_from(range(n))
-    for i in range(n-1):
-        G.add_edge(i, i+1)
-    return G
-
-def _make_grid_graph(r: int, c: int) -> nx.Graph:
-    G = nx.grid_2d_graph(r, c)
-    # relabel to 0..N-1
-    mapping = {node: i for i, node in enumerate(G.nodes())}
-    return nx.relabel_nodes(G, mapping)
 
 
 def make_default_qpu_set(*args, base_queue_delay_s: float = 0.0, **kwargs) -> tuple[dict, dict]:
-    """Return (qpus, noise_models) for a small, deterministic local testbed.
-
-    Provides multiple QPUs so Plan C can be exercised even if IBM fakes are unavailable.
-    Accepts extra args/kwargs for compatibility with callers
-    """
-    from qiskit_aer.noise import NoiseModel
+    """Return (qpus, noise_models) for a small deterministic local testbed."""
     from qiskit_aer.noise.errors import depolarizing_error
     from qdc_sched.core.hardware import HardwareProfile, QPUState
 
@@ -160,7 +132,6 @@ def make_default_qpu_set(*args, base_queue_delay_s: float = 0.0, **kwargs) -> tu
     noise_models = {}
 
     def _mk_line(n: int):
-        import networkx as nx
         G = nx.Graph()
         G.add_nodes_from(range(n))
         for i in range(n - 1):
@@ -168,16 +139,14 @@ def make_default_qpu_set(*args, base_queue_delay_s: float = 0.0, **kwargs) -> tu
         return G
 
     def _mk_grid(r: int, c: int):
-        import networkx as nx
         G = nx.grid_2d_graph(r, c)
         mapping = {node: i for i, node in enumerate(G.nodes())}
         return nx.relabel_nodes(G, mapping)
 
     configs = [
-        # (id, graph, oneq_err, twoq_err, readout_err, t1q, t2q, tmeas)
-        ('qpu_A', _mk_line(7), 1.2e-3, 2.4e-2, 2.5e-2, 40e-9, 320e-9, 1_100e-9),
-        ('qpu_B', _mk_grid(3, 3), 1.0e-3, 2.0e-2, 2.0e-2, 35e-9, 280e-9, 1_000e-9),
-        ('qpu_C', _mk_line(11), 0.9e-3, 1.6e-2, 1.8e-2, 30e-9, 240e-9, 900e-9),
+        ("qpu_A", _mk_line(7), 1.2e-3, 2.4e-2, 2.5e-2, 40e-9, 320e-9, 1_100e-9),
+        ("qpu_B", _mk_grid(3, 3), 1.0e-3, 2.0e-2, 2.0e-2, 35e-9, 280e-9, 1_000e-9),
+        ("qpu_C", _mk_line(11), 0.9e-3, 1.6e-2, 1.8e-2, 30e-9, 240e-9, 900e-9),
     ]
 
     for qid, G, oneq_err, twoq_err_scalar, ro_err, t1q, t2q, tmeas in configs:
@@ -206,9 +175,8 @@ def make_default_qpu_set(*args, base_queue_delay_s: float = 0.0, **kwargs) -> tu
 
 
 # ---------------------------
-# IBM Fake backends that maka up QPU set
+# IBM Fake backends as QPU set
 # ---------------------------
-import networkx as nx
 
 def _coupling_graph_from_backend(b) -> nx.Graph:
     cfg = b.configuration()
@@ -220,6 +188,7 @@ def _coupling_graph_from_backend(b) -> nx.Graph:
         if isinstance(e, (list, tuple)) and len(e) == 2:
             G.add_edge(int(e[0]), int(e[1]))
     return G
+
 
 def _avg_gate_metrics_from_properties(b) -> Tuple[float, float, float, float, float]:
     """Return (oneq_err, twoq_err, readout_err, oneq_time_s, twoq_time_s)."""
@@ -279,7 +248,7 @@ def make_ibm_fake_qpu_set(
     max_backends: int = 3,
     prefer: Optional[List[str]] = None,
     base_queue_delay_s: float = 0.0,
-) -> Tuple[Dict[str, 'QPUState'], Dict[str, NoiseModel]]:
+) -> Tuple[Dict[str, "QPUState"], Dict[str, NoiseModel]]:
     """Return (qpus, noise_models) from qiskit-ibm-runtime FakeProvider backends."""
     from qdc_sched.core.hardware import HardwareProfile, QPUState
 
@@ -290,13 +259,12 @@ def make_ibm_fake_qpu_set(
     for b in fakes:
         bid = _backend_id(b)
         G = _coupling_graph_from_backend(b)
-        n = len(G.nodes)
 
         oneq_err, twoq_err, ro_err, oneq_t, twoq_t = _avg_gate_metrics_from_properties(b)
 
         prof = HardwareProfile(
             qpu_id=bid,
-            num_qubits=int(n),
+            num_qubits=len(G.nodes),
             coupling_graph=G,
             base_queue_delay_s=float(base_queue_delay_s),
             oneq_gate_time_s=float(oneq_t),
@@ -306,6 +274,11 @@ def make_ibm_fake_qpu_set(
             twoq_error=float(twoq_err),
             readout_error=float(ro_err),
         )
+
+        # attach backend metadata dynamically for backend-profile timing helper
+        object.__setattr__(prof, "backend_name", bid)
+        object.__setattr__(prof, "backend_obj", b)
+
         qpus[bid] = QPUState(profile=prof)
 
         if bid not in noise_models:

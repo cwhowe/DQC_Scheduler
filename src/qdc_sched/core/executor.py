@@ -15,7 +15,12 @@ from qiskit_aer.noise import NoiseModel
 from .types import Job, Plan, RunToggles, Task, TaskGraph
 from .hardware import QPUState
 from .quality import QualityModel
-from .runtime import predict_exec_time_s
+from .runtime import (
+    predict_exec_time_s,
+    estimate_qpu_execution_s,
+    estimate_reconstruction_duration_s,
+    estimate_communication_duration_s,
+)
 from .metrics import MetricsRecorder, JobRunRecord
 from ..cutting import CutStrategy, FitCutCutStrategy, CutConstraints
 from ..cutting.assignment import MinMakespanGreedyAssignment
@@ -47,6 +52,44 @@ def _attach_timing_dicts(details: dict, timing_model: dict, timing_wall: dict) -
         },
     )
     return details
+
+
+def _effective_qpu_timing_mode(cfg) -> str:
+    return str(os.getenv("QDC_QPU_TIMING_MODE", getattr(cfg, "timing_mode", "analytic")) or "analytic").lower()
+
+
+class _CPUWorkerPool:
+    def __init__(self, n_workers: int):
+        import heapq
+        self._heapq = heapq
+        self.n_workers = max(1, int(n_workers or 1))
+        self.available = [(0.0, i) for i in range(self.n_workers)]
+        self._heapq.heapify(self.available)
+
+    def reserve(self, ready_time: float, duration_s: float):
+        avail_t, wid = self._heapq.heappop(self.available)
+        start_t = max(float(ready_time), float(avail_t))
+        end_t = start_t + max(0.0, float(duration_s))
+        self._heapq.heappush(self.available, (end_t, wid))
+        queue_delay = max(0.0, start_t - float(ready_time))
+        return int(wid), float(start_t), float(end_t), float(queue_delay)
+
+
+class _CommWorkerPool:
+    def __init__(self, n_workers: int):
+        import heapq
+        self._heapq = heapq
+        self.n_workers = max(1, int(n_workers or 1))
+        self.available = [(0.0, i) for i in range(self.n_workers)]
+        self._heapq.heapify(self.available)
+
+    def reserve(self, ready_time: float, duration_s: float):
+        avail_t, wid = self._heapq.heappop(self.available)
+        start_t = max(float(ready_time), float(avail_t))
+        end_t = start_t + max(0.0, float(duration_s))
+        self._heapq.heappush(self.available, (end_t, wid))
+        queue_delay = max(0.0, start_t - float(ready_time))
+        return int(wid), float(start_t), float(end_t), float(queue_delay)
 
 
 def _safe_noise_model(obj) -> Optional[NoiseModel]:
@@ -206,6 +249,8 @@ class Executor:
         self.metrics = metrics
         self.cfg = cfg
         self._aer_timing_cache: Dict[tuple, float] = {}
+        self.cpu_recon_pool = _CPUWorkerPool(int(os.getenv("QDC_CPU_RECON_WORKERS", "1") or 1))
+        self.comm_pool = _CommWorkerPool(int(os.getenv("QDC_COMM_WORKERS", "1") or 1))
 
     def _hash_circuit(self, circ: QuantumCircuit) -> str:
         try:
@@ -254,11 +299,17 @@ class Executor:
             return 0.0
         eff_shots = int(shots or 0) or int(getattr(self.cfg, "shots_default", 1000) or 1000)
 
-        mode = str(getattr(self.cfg, "timing_mode", "analytic") or "analytic").lower()
+        mode = _effective_qpu_timing_mode(self.cfg)
         if mode != "aer":
             from qdc_sched.core.profiler import profile_circuit
             sp = profile_circuit(circ)
-            return float(predict_exec_time_s(self.qpus[qid].profile, sp, shots=eff_shots))
+            dur, _meta = estimate_qpu_execution_s(
+                self.qpus[qid].profile,
+                circuit=circ,
+                prof=sp,
+                shots=eff_shots,
+            )
+            return float(dur)
 
         key = (qid, self._hash_circuit(circ), eff_shots, str(task_type), bool(getattr(self.cfg, "aer_timing_use_noise", False)))
         if key in self._aer_timing_cache:
@@ -276,7 +327,12 @@ class Executor:
         except Exception:
             from qdc_sched.core.profiler import profile_circuit
             sp = profile_circuit(circ)
-            dur = float(predict_exec_time_s(self.qpus[qid].profile, sp, shots=eff_shots))
+            dur, _meta = estimate_qpu_execution_s(
+                self.qpus[qid].profile,
+                circuit=circ,
+                prof=sp,
+                shots=eff_shots,
+            )
 
         self._aer_timing_cache[key] = float(dur)
         return float(dur)
@@ -305,7 +361,7 @@ class Executor:
                 end_s=float(start_s + dur_s),
                 label=None,
                 depends_on=None,
-                metadata={"plan": plan.kind, "k": len(qubits)},
+                metadata={"plan": plan.kind, "k": len(qubits), "timing_mode": _effective_qpu_timing_mode(self.cfg)},
             ))
             return tasks, aux
 
@@ -353,7 +409,7 @@ class Executor:
             for i, sc in enumerate(getattr(part, "subcircuits", []) or []):
                 sp = profile_circuit(sc)
                 k = max(1, int(getattr(sp, "width", 1) or 1))
-                dur = float(predict_exec_time_s(qpu.profile, sp, shots=int(job.shots or 0) or self.cfg.shots_default))
+                dur = float(self._estimate_exec_duration_s(qid, sc, int(job.shots or 0) or self.cfg.shots_default, "sampling"))
                 # Reserve-time qubits chosen later in apply_reservations (to reflect real free sets)
                 tasks.append(Task(
                     task_id=f"{job.job_id}:B{i}",
@@ -365,7 +421,7 @@ class Executor:
                     end_s=float(cursor + dur),
                     label=int(i),
                     depends_on=None,
-                    metadata={"plan": plan.kind, "k": k, "subcircuit_index": i},
+                    metadata={"plan": plan.kind, "k": k, "subcircuit_index": i, "timing_mode": _effective_qpu_timing_mode(self.cfg)},
                 ))
                 cursor += dur
             return tasks, aux
@@ -431,7 +487,7 @@ class Executor:
                 k = max(1, int(getattr(sp, "width", 1) or 1))
                 label_k[i] = k
                 for qid in qpu_ids:
-                    label_qpu_pred[i][qid] = float(predict_exec_time_s(self.qpus[qid].profile, sp, shots=int(job.shots or 0) or self.cfg.shots_default))
+                    label_qpu_pred[i][qid] = float(self._estimate_exec_duration_s(qid, sc, int(job.shots or 0) or self.cfg.shots_default, "sampling"))
 
             aux["label_k"] = label_k
             aux["label_qpu_pred_time"] = label_qpu_pred
@@ -488,7 +544,7 @@ class Executor:
                     end_s=float(cursors[qid] + dur),
                     label=int(i),
                     depends_on=None,
-                    metadata={"plan": plan.kind, "k": label_k[i], "subcircuit_index": i},
+                    metadata={"plan": plan.kind, "k": label_k[i], "subcircuit_index": i, "timing_mode": _effective_qpu_timing_mode(self.cfg)},
                 ))
                 cursors[qid] += dur
             return tasks, aux
@@ -673,32 +729,123 @@ class Executor:
 
         if plan.kind == "A_NO_CUT_SINGLE":
             t_exec_model = float((plan.details or {}).get("pred_exec_time_s", 0.0) or 0.0)
-        elif plan.kind == "B_CUT_SINGLE_SEQ":
+            comm_meta = {}
+        elif plan.kind in ("B_CUT_SINGLE_SEQ", "C_CUT_MULTI_QPU"):
             if q_only:
                 t_exec_model = float(
                     max(float(t.end_s) for t in q_only) - min(float(t.start_s) for t in q_only)
                 )
-            t_recon_model = float(details.get("recon_est_s", 0.0) or details.get("wall_recon_s", 0.0) or 0.0)
-        elif plan.kind == "C_CUT_MULTI_QPU":
-            if q_only:
-                t_exec_model = float(
-                    max(float(t.end_s) for t in q_only) - min(float(t.start_s) for t in q_only)
-                )
-            t_comm_model = (
-                float(getattr(job.constraints, "comm_overhead_s", 0.0) or 0.0)
-                if getattr(job.constraints, "allow_multi_qpu", False)
-                else 0.0
-            )
             t_recon_model = float(details.get("recon_est_s", 0.0) or details.get("wall_recon_s", 0.0) or 0.0)
 
-        # Append explicit COMM/RECON tasks using charged values
-        tasks2 = _append_comm_and_recon_tasks(
-            tasks,
-            job_id=job.job_id,
-            plan_kind=plan.kind,
-            comm_overhead_s=t_comm_model,
-            recon_s=t_recon_model,
-        )
+            num_subexperiments = float(
+                details.get("labels_used", 0.0)
+                or details.get("sampling_overhead", 0.0)
+                or 0.0
+            )
+            num_samples = float(details.get("sampling_overhead", 0.0) or 0.0)
+
+            if plan.kind == "C_CUT_MULTI_QPU":
+                used_qpus = details.get("used_qpus", []) or []
+                if not used_qpus:
+                    assignment = details.get("assignment", {}) or {}
+                    try:
+                        used_qpus = sorted({str(v) for v in assignment.values()})
+                    except Exception:
+                        used_qpus = []
+                if not used_qpus:
+                    used_qpus = details.get("qpu_candidates", []) or []
+                n_qpus_used = max(1, len(used_qpus))
+            else:
+                n_qpus_used = 1
+
+            t_comm_model, comm_meta = estimate_communication_duration_s(
+                num_subexperiments=float(num_subexperiments),
+                num_samples=float(num_samples),
+                n_qpus_used=int(max(1, n_qpus_used)),
+                plan_kind=str(plan.kind),
+            )
+            details["comm_timing_meta"] = dict(comm_meta or {})
+        else:
+            comm_meta = {}
+
+        # Append explicit COMM and CPU-hosted reconstruction tasks using charged values
+        tasks2 = list(tasks or [])
+        q_ids = [t.task_id for t in tasks2 if getattr(t, "kind", None) == "quantum" and getattr(t, "task_id", None)]
+        cursor = _max_end_s(tasks2, default=0.0)
+
+        comm_queue_delay_s = 0.0
+        comm_busy_time_s = 0.0
+        sim_comm_queue_s = 0.0
+        sim_comm_service_s = 0.0
+        comm_id = None
+
+        if float(t_comm_model) > 0.0:
+            ready_time = float(cursor)
+            comm_worker_id, comm_start, comm_end, qdelay = self.comm_pool.reserve(
+                ready_time,
+                float(t_comm_model),
+            )
+            comm_id = f"{job.job_id}:COMM0"
+            tasks2.append(
+                Task(
+                    task_id=comm_id,
+                    job_id=job.job_id,
+                    kind="communication",
+                    start_s=float(comm_start),
+                    end_s=float(comm_end),
+                    qpu_id=f"host_comm:{comm_worker_id}",
+                    qubits=None,
+                    label=None,
+                    depends_on=list(q_ids) if q_ids else None,
+                    metadata={
+                        "plan": plan.kind,
+                        "comm_s": float(t_comm_model),
+                        "comm_worker_id": int(comm_worker_id),
+                        "comm_timing_meta": dict(comm_meta or {}),
+                    },
+                )
+            )
+            comm_queue_delay_s = float(qdelay)
+            comm_busy_time_s = float(comm_end - comm_start)
+            sim_comm_queue_s = float(qdelay)
+            sim_comm_service_s = float(comm_end - comm_start)
+            cursor = float(comm_end)
+
+        cpu_queue_delay_s = 0.0
+        cpu_busy_time_s = 0.0
+        sim_recon_queue_s = 0.0
+        sim_recon_service_s = 0.0
+        if float(t_recon_model) > 0.0:
+            ready_time = float(cursor)
+            worker_id, recon_start, recon_end, qdelay = self.cpu_recon_pool.reserve(ready_time, float(t_recon_model))
+            dep = [comm_id] if comm_id is not None else list(q_ids) if q_ids else None
+            tasks2.append(
+                Task(
+                    task_id=f"{job.job_id}:RECON0",
+                    job_id=job.job_id,
+                    kind="reconstruction",
+                    start_s=float(recon_start),
+                    end_s=float(recon_end),
+                    qpu_id=f"host_recon:{worker_id}",
+                    qubits=None,
+                    label=None,
+                    depends_on=dep,
+                    metadata={"plan": plan.kind, "recon_s": float(t_recon_model), "cpu_worker_id": int(worker_id)},
+                )
+            )
+            cpu_queue_delay_s = float(qdelay)
+            cpu_busy_time_s = float(recon_end - recon_start)
+            sim_recon_queue_s = float(qdelay)
+            sim_recon_service_s = float(recon_end - recon_start)
+
+        details["comm_queue_delay_s"] = float(comm_queue_delay_s)
+        details["comm_busy_time_s"] = float(comm_busy_time_s)
+        details["sim_comm_queue_s"] = float(sim_comm_queue_s)
+        details["sim_comm_service_s"] = float(sim_comm_service_s)
+        details["cpu_queue_delay_s"] = float(cpu_queue_delay_s)
+        details["cpu_busy_time_s"] = float(cpu_busy_time_s)
+        details["sim_recon_queue_s"] = float(sim_recon_queue_s)
+        details["sim_recon_service_s"] = float(sim_recon_service_s)
 
         details = _ensure_taskgraph(details, job.job_id, tasks2)
 
@@ -802,7 +949,7 @@ class Executor:
                     end_s=float(cursor + per_label),
                     label=int(i),
                     depends_on=None,
-                    metadata={"plan": plan.kind, "k": int(k_each), "approx_from_plan": True, "subcircuit_index": i},
+                    metadata={"plan": plan.kind, "k": int(k_each), "approx_from_plan": True, "subcircuit_index": i, "timing_mode": _effective_qpu_timing_mode(self.cfg)},
                 ))
                 cursor += per_label
             return tasks, aux
@@ -841,7 +988,7 @@ class Executor:
                     end_s=float(start + dur),
                     label=int(i),
                     depends_on=None,
-                    metadata={"plan": plan.kind, "k": int(max_local), "approx_from_plan": True, "subcircuit_index": i},
+                    metadata={"plan": plan.kind, "k": int(max_local), "approx_from_plan": True, "subcircuit_index": i, "timing_mode": _effective_qpu_timing_mode(self.cfg)},
                 ))
                 cursor_by_qpu[qid] = float(start + dur)
             aux["assignment"] = assignment

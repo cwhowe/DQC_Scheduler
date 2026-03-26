@@ -5,6 +5,16 @@ from typing import Optional, Dict, Any, List, Tuple, Literal
 TaskType = Literal["counts", "expectation"]
 
 @dataclass(frozen=True)
+class QpuTimingMetadata:
+    timing_mode: str
+    duration_source: str
+    backend_name: Optional[str] = None
+    per_shot_duration_s: Optional[float] = None
+    total_duration_s: Optional[float] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class JobConstraints:
     slo_s: Optional[float] = None
     min_fidelity: Optional[float] = None
@@ -12,7 +22,7 @@ class JobConstraints:
     force_cutting: bool = False
     allow_multi_qpu: bool = True
     max_cuts: int = 3
-    # Communication overhead model, needs updating.
+    # Legacy fallback communication scalar. Phase 4 uses explicit comm timing/resource models.
     comm_overhead_s: float = 0.25
 
 @dataclass

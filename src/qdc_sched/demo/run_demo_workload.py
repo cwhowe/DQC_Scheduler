@@ -16,7 +16,7 @@ from qdc_sched.core.quality import QualityModel
 from qdc_sched.core.scheduler import Scheduler, SchedulerConfig
 from qdc_sched.core.executor import ExecConfig
 from qdc_sched.core.types import Job, RunToggles, JobConstraints
-
+from qdc_sched.ibm.fake_loader import make_ibm_fake_qpu_set
 
 def ghz(n: int, measure: bool = True) -> QuantumCircuit:
     qc = QuantumCircuit(n)
@@ -307,6 +307,11 @@ def _export_results(sched: Scheduler, outdir: str) -> None:
             "job_id","qpu_id","plan_kind","submit_time_s",
             "t_schedule_s","t_partition_s","t_mapping_s","t_execution_s",
             "t_reconstruction_s","end_to_end_s","fidelity_proxy",
+            "comm_queue_delay_s","comm_busy_time_s",
+            "cpu_queue_delay_s","cpu_busy_time_s",
+            "sim_comm_queue_s","sim_comm_service_s","sim_comm_s",
+            "sim_recon_queue_s","sim_recon_service_s","sim_recon_s",
+            "pred_comm_queue_s","pred_comm_service_s","pred_comm_s",
             "fidelity_estimated","details_json"
         ]
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -324,6 +329,19 @@ def _export_results(sched: Scheduler, outdir: str) -> None:
                 "t_reconstruction_s": getattr(r, "t_reconstruction_s", None),
                 "end_to_end_s": getattr(r, "end_to_end_s", None),
                 "fidelity_proxy": getattr(r, "fidelity_proxy", None),
+                "comm_queue_delay_s": ((getattr(r, "details", {}) or {}).get("comm_queue_delay_s") if getattr(r, "details", None) is not None else None),
+                "comm_busy_time_s": ((getattr(r, "details", {}) or {}).get("comm_busy_time_s") if getattr(r, "details", None) is not None else None),
+                "cpu_queue_delay_s": ((getattr(r, "details", {}) or {}).get("cpu_queue_delay_s") if getattr(r, "details", None) is not None else None),
+                "cpu_busy_time_s": ((getattr(r, "details", {}) or {}).get("cpu_busy_time_s") if getattr(r, "details", None) is not None else None),
+                "sim_comm_queue_s": ((getattr(r, "details", {}) or {}).get("sim_comm_queue_s") if getattr(r, "details", None) is not None else None),
+                "sim_comm_service_s": ((getattr(r, "details", {}) or {}).get("sim_comm_service_s") if getattr(r, "details", None) is not None else None),
+                "sim_comm_s": ((getattr(r, "details", {}) or {}).get("sim_comm_s") if getattr(r, "details", None) is not None else None),
+                "sim_recon_queue_s": ((getattr(r, "details", {}) or {}).get("sim_recon_queue_s") if getattr(r, "details", None) is not None else None),
+                "sim_recon_service_s": ((getattr(r, "details", {}) or {}).get("sim_recon_service_s") if getattr(r, "details", None) is not None else None),
+                "sim_recon_s": ((getattr(r, "details", {}) or {}).get("sim_recon_s") if getattr(r, "details", None) is not None else None),
+                "pred_comm_queue_s": ((getattr(r, "details", {}) or {}).get("pred_comm_queue_s") if getattr(r, "details", None) is not None else None),
+                "pred_comm_service_s": ((getattr(r, "details", {}) or {}).get("pred_comm_service_s") if getattr(r, "details", None) is not None else None),
+                "pred_comm_s": ((getattr(r, "details", {}) or {}).get("pred_comm_s") if getattr(r, "details", None) is not None else None),
                 "fidelity_estimated": getattr(r, "fidelity_estimated", None),
                 "details_json": json.dumps(getattr(r, "details", {}) or {}, default=str),
             })
@@ -375,19 +393,57 @@ def run_workload(full_eval: bool = False) -> None:
     base_B = float(os.getenv("QDC_QPU_B_BASE_DELAY", "0.2"))
     base_C = float(os.getenv("QDC_QPU_C_BASE_DELAY", "0.3"))
 
-    qpus: Dict[str, QPUState] = {
-        "qpu_A": make_line_qpu("qpu_A", 7, base_queue_delay_s=base_A),
-        "qpu_B": make_line_qpu("qpu_B", 7, base_queue_delay_s=base_B),
-    }
-    if not exclude_c:
-        qpus["qpu_C"] = make_line_qpu("qpu_C", 14, base_queue_delay_s=base_C)
+    qpu_source = os.getenv("QDC_QPU_SOURCE", "line").strip().lower()
+
+    if qpu_source == "ibm_fake":
+        qpus, _noise_models = make_ibm_fake_qpu_set()
+        if exclude_c and "qpu_C" in qpus:
+            del qpus["qpu_C"]
+        # Preserve demo-level base-delay overrides on the returned profiles.
+        try:
+            qpus["qpu_A"].profile.base_queue_delay_s = float(base_A)
+            qpus["qpu_B"].profile.base_queue_delay_s = float(base_B)
+            if not exclude_c and "qpu_C" in qpus:
+                qpus["qpu_C"].profile.base_queue_delay_s = float(base_C)
+        except Exception:
+            pass
+    else:
+        qpu_source = os.getenv("QDC_QPU_SOURCE", "line").strip().lower()
+
+        if qpu_source == "ibm_fake":
+            qpus, _noise_models = make_ibm_fake_qpu_set()
+
+            if exclude_c and "qpu_C" in qpus:
+                del qpus["qpu_C"]
+
+            try:
+                if "qpu_A" in qpus:
+                    qpus["qpu_A"].profile.base_queue_delay_s = float(base_A)
+                if "qpu_B" in qpus:
+                    qpus["qpu_B"].profile.base_queue_delay_s = float(base_B)
+                if not exclude_c and "qpu_C" in qpus:
+                    qpus["qpu_C"].profile.base_queue_delay_s = float(base_C)
+            except Exception:
+                pass
+        else:
+            qpus: Dict[str, QPUState] = {
+                "qpu_A": make_line_qpu("qpu_A", 7, base_queue_delay_s=base_A),
+                "qpu_B": make_line_qpu("qpu_B", 7, base_queue_delay_s=base_B),
+            }
+            if not exclude_c:
+                qpus["qpu_C"] = make_line_qpu("qpu_C", 14, base_queue_delay_s=base_C)
 
     reserve_counts = _install_reserve_counters(qpus)
     inject_congestion_bursts(qpus)
 
     cfg = SchedulerConfig()
-    timing_mode_env = os.getenv("QDC_TIMING_MODE", "analytic").strip().lower()
-    timing_mode = "aer" if timing_mode_env in ("aer", "aer_timing") else "analytic"
+    timing_mode_env = os.getenv("QDC_TIMING_MODE", os.getenv("QDC_QPU_TIMING_MODE", "analytic")).strip().lower()
+    if timing_mode_env in ("aer", "aer_timing"):
+        timing_mode = "aer"
+    elif timing_mode_env in ("backend_profile", "backend", "backend_timing"):
+        timing_mode = "backend_profile"
+    else:
+        timing_mode = "analytic"
     cfg.exec_cfg = ExecConfig(
         reserve_nonsim=True,
         timing_mode=timing_mode,

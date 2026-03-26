@@ -33,3 +33,4 @@ outputs/
 
 # --- Qiskit caches ---
 .qiskit/
+.dqc_venv/

@@ -16,7 +16,7 @@ from ..cutting.base import CutConstraints
 from ..cutting import CutStrategy, QiskitAddonCutStrategy, FitCutCutStrategy
 from .hardware import QPUState
 from .quality import QualityModel
-from .runtime import predict_exec_time_s
+from .runtime import estimate_qpu_execution_s, estimate_reconstruction_duration_s
 from qdc_sched.cutting.assignment import MinMakespanGreedyAssignment
 from qdc_sched.core.profiler import profile_circuit
 
@@ -65,10 +65,11 @@ class Planner:
         self.quality = quality
         self.cfg = cfg
 
-    def _predict_host_reconstruction_s(self, sampling: float) -> float:
-        base = float(os.getenv("QDC_HOST_RECON_BASE_S", "0.0") or 0.0)
-        per = float(os.getenv("QDC_HOST_RECON_PER_EXEC_S", "0.0") or 0.0)
-        return base + per * float(sampling)
+    def _predict_host_reconstruction_s(self, sampling: float) -> tuple[float, dict]:
+        return estimate_reconstruction_duration_s(
+            num_subexperiments=float(sampling),
+            num_samples=float(sampling),
+        )
 
     def choose_plan(self, job: Job, prof: CircuitProfile, now_s: float, ranked_qpus) -> Plan:
         _planner_budget_s = float(os.getenv("QDC_PLANNER_BUDGET_S", "1.0"))
@@ -106,7 +107,7 @@ class Planner:
         # Plan A: no cut, single QPU
         # -----------------
         if not (job.task_type == "expectation" and job.constraints.allow_cutting and job.constraints.force_cutting):
-            for (qpu_id, _, pred_t, fid_proxy) in ranked_qpus[: self.cfg.top_k_qpus]:
+            for (qpu_id, _, _ranked_pred_t, fid_proxy) in ranked_qpus[: self.cfg.top_k_qpus]:
                 st = self.qpus[qpu_id]
                 free = st.find_free_connected_subgraph(prof.width, now_s)
                 if free is None:
@@ -114,7 +115,7 @@ class Planner:
                 base_delay = float(getattr(st.profile, 'base_queue_delay_s', 0.0) or 0.0)
                 start_probe_s = float(now_s) + float(base_delay)
                 pred_queue = base_delay + _wait_s(qpu_id, prof.width, start_probe_s)
-                pred_exec  = pred_t
+                pred_exec, pred_exec_meta = estimate_qpu_execution_s(st.profile, circuit=job.circuit, prof=prof, shots=job.shots)
 
                 plan = Plan(
                     kind="A_NO_CUT_SINGLE",
@@ -127,6 +128,7 @@ class Planner:
                         "pred_exec_time_s": pred_exec,
                         "pred_recon_s": 0.0,
                         "pred_comm_s": 0.0,
+                        "pred_exec_meta": pred_exec_meta,
                     }
                 )
                 candidates.append(plan)
@@ -137,7 +139,8 @@ class Planner:
             if cap > 1:
                 fid_proxy = self.quality.fidelity_proxy_from_profile(qpu_id, prof)
                 try:
-                    pred_t = float(predict_exec_time_s(st.profile, prof, shots=job.shots))
+                    pred_t, _pred_meta = estimate_qpu_execution_s(st.profile, circuit=job.circuit, prof=prof, shots=job.shots)
+                    pred_t = float(pred_t)
                 except Exception:
                     pred_t = 0.05
                 cut_qpu_pool.append((qpu_id, pred_t, float(fid_proxy), int(cap)))
@@ -215,9 +218,14 @@ class Planner:
                     sub_profiles.append(profile_circuit(sc))
                 if len(sub_profiles) != len(part.subcircuits):
                     break
-                base_time = sum(predict_exec_time_s(self.qpus[qpu_id].profile, sp, shots=job.shots) for sp in sub_profiles)
+                base_time = 0.0
+                sub_timing_meta = []
+                for sc, sp in zip(part.subcircuits, sub_profiles):
+                    sub_t, sub_meta = estimate_qpu_execution_s(self.qpus[qpu_id].profile, circuit=sc, prof=sp, shots=job.shots)
+                    base_time += float(sub_t)
+                    sub_timing_meta.append(sub_meta)
                 sampling = float(part.est_executions or 1.0)
-                recon_est = self._predict_host_reconstruction_s(sampling)
+                recon_est, recon_meta = self._predict_host_reconstruction_s(sampling)
                 max_width = max(int(sp.width) for sp in sub_profiles) if sub_profiles else int(prof.width)
                 base_delay = float(getattr(self.qpus[qpu_id].profile, 'base_queue_delay_s', 0.0) or 0.0)
                 start_probe_s = float(now_s) + float(base_delay)
@@ -250,6 +258,8 @@ class Planner:
                         "max_local_qubits": int(max_local),
                         "target_labels": int(chosen_labels),
                         "partition_subcircuits": list(getattr(part, "subcircuits", []) or []),
+                        "sub_qpu_timing_meta": sub_timing_meta,
+                        "recon_timing_meta": recon_meta,
                     },
                 ))
 
@@ -355,11 +365,21 @@ class Planner:
 
                 label_costs = {i: float(sp.twoq_count + 0.2 * sp.oneq_count) for i, sp in enumerate(sub_profiles)}
                 label_qpu_pred_time = {i: {} for i in labels}
-                for i, sp in enumerate(sub_profiles):
+                sub_timing_meta = {i: {} for i in labels}
+
+                for i, (sc, sp) in enumerate(zip(part.subcircuits, sub_profiles)):
                     if _budget_exceeded():
                         break
                     for qid in candidates_qpus:
-                        label_qpu_pred_time[i][qid] = predict_exec_time_s(self.qpus[qid].profile, sp, shots=job.shots)
+                        exec_s, timing_meta = estimate_qpu_execution_s(
+                            self.qpus[qid].profile,
+                            circuit=sc,
+                            prof=sp,
+                            shots=job.shots,
+                        )
+                        label_qpu_pred_time[i][qid] = float(exec_s)
+                        sub_timing_meta[i][qid] = dict(timing_meta or {})
+                        sub_timing_meta[i][qid].setdefault("pred_exec_time_s", float(exec_s))
                 if any(len(v) != len(candidates_qpus) for v in label_qpu_pred_time.values()):
                     if debug_c:
                         print(f"[PLAN-C-SKIP] job={job.job_id} pair={candidates_qpus} reason=planner_budget_during_pred_time")
@@ -438,7 +458,7 @@ class Planner:
                     q_load = sum(float(label_qpu_pred_time[lab][qid]) for lab, q in assignment.items() if q == qid)
                     pred_finish = max(pred_finish, float(per_qpu_wait_s.get(qid, 0.0)) + (q_load * sampling))
 
-                recon_est = self._predict_host_reconstruction_s(sampling)
+                recon_est, recon_meta = self._predict_host_reconstruction_s(sampling)
 
                 used_qpus_list = sorted(list(used_qpus))
                 pred_comm = float(job.constraints.comm_overhead_s or 0.0) if len(used_qpus_list) >= 2 else 0.0
@@ -486,6 +506,8 @@ class Planner:
                         "max_local_qubits": int(max_local),
                         "target_labels": int(chosen_labels),
                         "partition_subcircuits": list(getattr(part, "subcircuits", []) or []),
+                        "sub_qpu_timing_meta": sub_timing_meta,
+                        "recon_timing_meta": recon_meta,
                     },
                 ))
         # -----------------

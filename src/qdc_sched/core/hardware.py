@@ -8,26 +8,31 @@ class HardwareProfile:
     qpu_id: str
     num_qubits: int
     coupling_graph: nx.Graph
-    # Per-edge 2Q error
-    twoq_error: Dict[Tuple[int,int], float] = field(default_factory=dict)
-    # Per-qubit readout error
-    ro_error: Dict[int, float] = field(default_factory=dict)
+
+    # Optional detailed error maps
+    twoq_error_map: Dict[Tuple[int, int], float] = field(default_factory=dict)
+    ro_error_map: Dict[int, float] = field(default_factory=dict)
+
     # Timing model (seconds)
     t_1q: float = 35e-9
     t_2q: float = 250e-9
     t_meas: float = 1.0e-6
     t_reset: float = 1.0e-6
+
     # Queue delay model (seconds)
     base_queue_delay_s: float = 0.0
+
     # Simple timing model (used for predicted runtime; seconds)
     oneq_gate_time_s: float = 35e-9
     twoq_gate_time_s: float = 300e-9
     meas_time_s: float = 1_000e-9
     shot_overhead_s: float = 0.0
-    # Optional scalar error rates (used for quality proxy)
+
+    # Scalar fallback error rates (used for quality proxy)
     oneq_error: float = 1e-3
     twoq_error: float = 2e-2
     readout_error: float = 2e-2
+
 
 @dataclass
 class Reservation:
@@ -36,13 +41,13 @@ class Reservation:
     start_s: float
     end_s: float
 
+
 class QPUState:
     """Tracks spatial concurrency on disjoint qubit sets via reservations."""
     def __init__(self, profile: HardwareProfile):
         self.profile = profile
         self._reservations: List[Reservation] = []
 
-    # Can probably remove this: old reservation defenition.
     @property
     def reservations(self) -> List[Reservation]:
         return self._reservations
@@ -82,7 +87,7 @@ class QPUState:
         for seed in sorted(free_nodes):
             if seed in used:
                 continue
-            sub = set([seed])
+            sub = {seed}
             frontier = [seed]
             while frontier and len(sub) < k:
                 u = frontier.pop()
@@ -106,7 +111,6 @@ class QPUState:
         if not free_nodes:
             return 0
         H = G.subgraph(free_nodes)
-        import networkx as nx
         return max((len(c) for c in nx.connected_components(H)), default=0)
 
     def estimate_wait_s(self, needed_qubits: int, now_s: float) -> float:
@@ -117,7 +121,6 @@ class QPUState:
         if needed <= 0:
             return 0.0
 
-        # Always clear completed reservations before planning.
         self.release_completed(now_s)
 
         if self.max_connected_free_qubits(now_s) >= needed:
@@ -133,9 +136,7 @@ class QPUState:
                 continue
 
         for t in sorted(set(ends)):
-            # simulate time t after some reservations end
             if self.max_connected_free_qubits(t) >= needed:
                 return max(0.0, t - now_s)
 
         return float("inf")
-
