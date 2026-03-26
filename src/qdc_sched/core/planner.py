@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Set
 import math
 import signal
@@ -53,8 +53,8 @@ class _qdc_time_limit:
 @dataclass
 class PlannerConfig:
     top_k_qpus: int = 5
-    cut_constraints: CutConstraints = CutConstraints()
-    cut_strategy: CutStrategy = FitCutCutStrategy()
+    cut_constraints: CutConstraints = field(default_factory=CutConstraints)
+    cut_strategy: CutStrategy = field(default_factory=FitCutCutStrategy)
     weight_time: float = 1.0
     weight_quality: float = 1.0
     weight_fairness: float = 0.0
@@ -85,6 +85,7 @@ class Planner:
         _planner_approx_partition = os.getenv("QDC_PLANNER_APPROX_PARTITION", "1") not in ("0", "false", "False")
         _skip_plan_b_for_forced_wide = os.getenv("QDC_SKIP_PLAN_B_FOR_FORCED_WIDE", "1") not in ("0", "false", "False")
         _debug_plan_b = os.getenv("QDC_DEBUG_PLAN_B", "0") == "1"
+        _planner_ignore_recon = os.getenv("QDC_PLANNER_IGNORE_RECON", "1") not in ("0", "false", "False")
 
         def _wait_s(qpu_id: str, need: int, at_s: float) -> float:
             """Estimate additional wait (beyond base_queue_delay_s) at a specific time.
@@ -236,7 +237,9 @@ class Planner:
                 pred_recon = float(recon_est)
                 pred_comm  = 0.0
 
-                pred_total = pred_queue + (pred_exec * float(sampling)) + pred_recon + pred_comm
+                pred_total = pred_queue + (pred_exec * float(sampling)) + pred_comm
+                if not _planner_ignore_recon:
+                    pred_total += pred_recon
 
                 candidates.append(Plan(
                     kind="B_CUT_SINGLE_SEQ",
@@ -279,16 +282,20 @@ class Planner:
             max_exact_states = int(os.getenv("QDC_C_EXACT_PACK_MAX_STATES", "256"))
             max_c_subsets = int(os.getenv("QDC_C_MAX_SUBSETS", "8"))
 
-            # Score only 2-QPU pairs. This keeps planning bounded and makes C compare
-            # cleanly as A+B, A+C, B+C instead of exploring larger subsets. COULD CHANGE THIS LATER
+
             seen_subset_sig = set()
             subset_list = []
-            for subset in itertools.combinations(all_candidates_qpus, 2):
-                sig = tuple(sorted(subset))
-                if sig in seen_subset_sig:
-                    continue
-                seen_subset_sig.add(sig)
-                subset_list.append(list(subset))
+            max_c_subset_size = int(os.getenv("QDC_C_MAX_SUBSET_SIZE", "3"))
+            for r in range(2, min(len(all_candidates_qpus), max_c_subset_size) + 1):
+                for subset in itertools.combinations(all_candidates_qpus, r):
+                    sig = tuple(sorted(subset))
+                    if sig in seen_subset_sig:
+                        continue
+                    seen_subset_sig.add(sig)
+                    subset_list.append(list(subset))
+            
+            # Sort subset_list descending by bottleneck capacity so we evaluate the best pairs/triplets first
+            subset_list.sort(key=lambda s: min(int(self.qpus[qid].max_connected_free_qubits(now_s)) for qid in s), reverse=True)
             subset_list = subset_list[:max(1, max_c_subsets)]
 
             for candidates_qpus in subset_list:
@@ -468,7 +475,9 @@ class Planner:
                     for qid in used_qpus_list
                 ) if used_qpus_list else float('inf')
                 pred_recon = float(recon_est)
-                pred_total = float(pred_finish) + pred_comm + pred_recon
+                pred_total = float(pred_finish) + pred_comm
+                if not _planner_ignore_recon:
+                    pred_total += pred_recon
                 fid_proxy = max(float(self.quality.fidelity_proxy_from_profile(qid, prof)) for qid in used_qpus_list)
 
                 if debug_c:

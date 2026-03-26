@@ -1,8 +1,6 @@
-#!/home/uom/howe0427/Scheduler/Circuit_cutting/dqc_sched_repo/.dqc_venv/bin/python
-# -*- coding: utf-8 -*-
-import re
+#!/Users/raghavmundada/UMN/Research/DQC_Scheduler/.dqc_venv/bin/python3.13
 import sys
 from spnego.__main__ import main
 if __name__ == '__main__':
-    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
     sys.exit(main())

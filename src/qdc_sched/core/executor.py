@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple, List
 import hashlib
 import os
@@ -237,9 +237,9 @@ class ExecConfig:
     aer_timing_include_transpile: bool = False
 
     # Cutting
-    cut_constraints: CutConstraints = CutConstraints()
-    cut_strategy: CutStrategy = FitCutCutStrategy()
-    partition_assignment_policy: Any = MinMakespanGreedyAssignment()
+    cut_constraints: CutConstraints = field(default_factory=CutConstraints)
+    cut_strategy: CutStrategy = field(default_factory=FitCutCutStrategy)
+    partition_assignment_policy: Any = field(default_factory=MinMakespanGreedyAssignment)
 
 class Executor:
     def __init__(self, qpus: Dict[str, QPUState], quality: QualityModel, metrics: MetricsRecorder, cfg: ExecConfig):
