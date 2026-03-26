@@ -58,6 +58,7 @@ def make_line_qpu(qpu_id: str, n: int, base_queue_delay_s: float) -> QPUState:
         coupling_graph=g,
         base_queue_delay_s=base_queue_delay_s,
     )
+    object.__setattr__(hp, "reconstruction_per_exec_s", float(os.getenv("QDC_DEMO_RECON_PER_EXEC_S", "0.0")))
     return QPUState(hp)
 
 
