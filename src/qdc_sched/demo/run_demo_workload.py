@@ -141,6 +141,7 @@ def make_workload(
     wide_slots = set(rng.sample(range(n_jobs), k=n_wide)) if n_wide > 0 else set()
 
     wide_widths = _parse_int_list("QDC_WIDE_WIDTHS", "10,12,14,16")
+    med_widths = _parse_int_list("QDC_MED_EXPECT_WIDTHS", "4,6,7")
     wide_shots = _parse_int_list("QDC_WIDE_SHOTS", "500,1000,2000")
     wide_depths = _parse_int_list("QDC_WIDE_DEPTHS", "16,24,32")
     wide_family = os.getenv("QDC_WIDE_FAMILY", "random_cx")
@@ -188,7 +189,7 @@ def make_workload(
             wl.append((t, job))
             continue
 
-        width = rng.choice(wide_widths)
+        width = rng.choice(med_widths)
         shots = rng.choice([100, 200, 500])
         med_family = os.getenv("QDC_MED_EXPECT_FAMILY", "ghz")
         med_depths = _parse_int_list("QDC_MED_EXPECT_DEPTHS", "8,12,16")
