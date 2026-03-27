@@ -280,7 +280,7 @@ class Planner:
             max_c_subsets = int(os.getenv("QDC_C_MAX_SUBSETS", "8"))
 
             # Score only 2-QPU pairs. This keeps planning bounded and makes C compare
-            # cleanly as A+B, A+C, B+C instead of exploring larger subsets.
+            # cleanly as A+B, A+C, B+C instead of exploring larger subsets. COULD CHANGE THIS LATER
             seen_subset_sig = set()
             subset_list = []
             for subset in itertools.combinations(all_candidates_qpus, 2):

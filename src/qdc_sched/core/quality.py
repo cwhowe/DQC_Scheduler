@@ -17,11 +17,9 @@ class QualityModel:
     def fidelity_proxy_from_profile(self, qpu_id: str, prof: CircuitProfile) -> float:
         # For now proxy: exponential decay with 2Q and 1Q counts (2/06/2026)
         # Replace with calibration / learned proxy later.
-        # defaults:
         p2 = 0.010
         p1 = 0.001
         fid = math.exp(-p2*prof.twoq_count - p1*prof.oneq_count)
-        # clamp
         return max(0.0, min(1.0, fid))
 
     def estimated_fidelity_counts(self, qc: QuantumCircuit, qpu_id: str, shots: int = 2000) -> float:

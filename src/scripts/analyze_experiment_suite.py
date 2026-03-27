@@ -40,8 +40,6 @@ def _jain_index(xs: List[float]) -> float:
 
 
 def _load_csv(path: Path):
-    # Some runs store very large JSON blobs in details_json / metadata_json.
-    # Raise the csv parser field limit so DictReader can handle them.
     max_int = sys.maxsize
     while True:
         try:

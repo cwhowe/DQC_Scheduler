@@ -25,10 +25,6 @@ class JobRunRecord:
 
 class MetricsRecorder:
     """Collect per-job records plus (optional) per-task event objects.
-
-    The scheduler currently exports tasks from `sched.task_log`. While we work toward
-    a single canonical event stream, collecting tasks here provides an easy fallback
-    and makes it harder to accidentally "lose" task events during refactors.
     """
 
     def __init__(self):

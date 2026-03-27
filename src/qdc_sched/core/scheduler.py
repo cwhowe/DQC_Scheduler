@@ -320,7 +320,7 @@ class Scheduler:
 
             it.attempts += 1
 
-            # Recompute ranking each attempt (availability + quality heuristics can change as time advances).
+            # Recompute ranking each attempt (availability + quality heuristics can change as time advances)
             ranked = rank_qpus(
                 it.prof,
                 self.qpus,

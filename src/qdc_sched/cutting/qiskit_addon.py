@@ -16,10 +16,10 @@ _QDC_CUT_FALLBACK_PARTITION = os.environ.get("QDC_CUT_FALLBACK_PARTITION", "1") 
 
 
 def _naive_chunk_partition(circuit: QuantumCircuit, max_subq: int):
-    """Split logical qubits into contiguous chunks of size <= max_subq.
+    """Split logical qubits into contiguous chunks of size <= max_subq
 
-    This is intentionally approximate and is meant for planner/demo timing only.
-    Cross-chunk operations are dropped so width/depth/2q-count stay cheap to estimate.
+    This is intentionally approximate and is meant for planner/demo timing only
+    Cross-chunk operations are dropped so width/depth/2q-count stay cheap to estimate
     """
     from qiskit.circuit import QuantumCircuit as Qc
 

@@ -128,8 +128,7 @@ def _append_comm_and_recon_tasks(
     comm_dep_task_ids: Optional[List[str]] = None,
     recon_dep_task_ids: Optional[List[str]] = None,
 ) -> List[Task]:
-    """Append optional COMM0 and RECON0 tasks.
-
+    """
     COMM0 depends on all quantum tasks unless comm_dep_task_ids is provided.
     RECON0 depends on COMM0 if present else all quantum tasks unless recon_dep_task_ids is provided.
     """

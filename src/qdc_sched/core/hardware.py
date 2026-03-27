@@ -9,7 +9,7 @@ class HardwareProfile:
     num_qubits: int
     coupling_graph: nx.Graph
 
-    # Optional detailed error maps
+    # error maps (optional)
     twoq_error_map: Dict[Tuple[int, int], float] = field(default_factory=dict)
     ro_error_map: Dict[int, float] = field(default_factory=dict)
 
@@ -22,7 +22,7 @@ class HardwareProfile:
     # Queue delay model (seconds)
     base_queue_delay_s: float = 0.0
 
-    # Simple timing model (used for predicted runtime; seconds)
+    # Simple timing model (used for predicted runtime. seconds)
     oneq_gate_time_s: float = 35e-9
     twoq_gate_time_s: float = 300e-9
     meas_time_s: float = 1_000e-9

@@ -659,7 +659,7 @@ def run_one(spec: RunSpec, out_root: Path) -> Path:
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Keep planner fast and deterministic for experiment sweeps.
+    # Keep planner fast and deterministic for experiment sweeps
     env_defaults = {
         "QDC_CUT_FAST_PARTITION": "1",
         "QDC_PLANNER_APPROX_PARTITION": "1",
