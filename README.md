@@ -17,11 +17,9 @@ It generates a mixed workload, schedules it over simulated time, and exports res
 
 From the repo root:
 
-
-python -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -e .
+```bash
+python -m venv .venv && source .venv/bin/activate && pip install -e .
+```
 
 
 Then run:
