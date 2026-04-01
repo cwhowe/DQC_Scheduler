@@ -1013,16 +1013,50 @@ class Executor:
         reserve = bool(getattr(toggles, "simulate_only", False) or getattr(self.cfg, "reserve_nonsim", False))
         reserve_info = self.apply_reservations(tasks, now_s=now_s, reserve=reserve)
 
-        # Phase 3: execute (Aer primitives) + reconstruction
-        out, exec_extra = self.maybe_execute(job, plan, aux, toggles)
+        # Phase 3: conditionally execute asynchronously
+        exec_toggles = toggles
+        if plan.kind == "D_WAIT" or plan.kind == "A_NO_CUT_SINGLE" or not getattr(toggles, "compute_expectation", True):
+            out, exec_extra = self.maybe_execute(job, plan, aux, toggles)
+            t1_wall = time.perf_counter()
+            rec = self.assemble_record(
+                job, plan, now_s=now_s,
+                t0_wall=t0_wall, t1_wall=t1_wall,
+                tasks=tasks, aux=aux, reserve_info=reserve_info, exec_extra=exec_extra,
+            )
+            self.metrics.add(rec)
+            return out, rec
 
-        # Phase 4: assemble record (also adds COMM/RECON tasks to graph)
+        # For heavy simulation jobs (Plan B/C), assemble the record with predictions first
+        exec_extra = {}
         t1_wall = time.perf_counter()
         rec = self.assemble_record(
             job, plan, now_s=now_s,
             t0_wall=t0_wall, t1_wall=t1_wall,
             tasks=tasks, aux=aux, reserve_info=reserve_info, exec_extra=exec_extra,
         )
-
         self.metrics.add(rec)
-        return out, rec
+
+        global _async_qpu_pool
+        if "_async_qpu_pool" not in globals():
+            from concurrent.futures import ThreadPoolExecutor
+            import os
+            workers = int(os.getenv("QDC_ASYNC_EXEC_WORKERS", "4"))
+            global _async_qpu_pool
+            _async_qpu_pool = ThreadPoolExecutor(max_workers=workers)
+
+        def _bg_execute():
+            bg_out, bg_extra = self.maybe_execute(job, plan, aux, exec_toggles)
+            # Update the record in-place once finished so logs contain real-time info
+            if rec.details is None:
+                rec.details = {}
+            rec.details.update(bg_extra)
+            if bg_out is not None:
+                rec.details["async_final_out"] = bg_out
+            return bg_out, bg_extra
+
+        fut = _async_qpu_pool.submit(_bg_execute)
+        if rec.details is None:
+            rec.details = {}
+        rec.details["async_eval_future"] = fut
+
+        return None, rec
