@@ -552,6 +552,14 @@ def run_workload(full_eval: bool = False) -> None:
     if stop_reason:
         print("[DEMO] stop_reason:", stop_reason)
 
+    try:
+        import qdc_sched.core.executor as executor_mod
+        if hasattr(executor_mod, "_async_qpu_pool"):
+            print("\n[DEMO] Scheduler finished in real-time! Waiting for background `SamplerV2` quantum simulations to complete mathematically...")
+            executor_mod._async_qpu_pool.shutdown(wait=True)
+    except Exception:
+        pass
+
     _print_histogram(plan_ctr)
 
     outdir = os.getenv("QDC_OUTDIR", "results/demo_workload")
