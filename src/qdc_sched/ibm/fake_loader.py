@@ -5,6 +5,7 @@ import warnings
 import importlib
 import inspect
 import pkgutil
+import os
 
 from qiskit_aer.noise import NoiseModel
 
@@ -75,7 +76,15 @@ def _discover_fake_backends() -> List:
 
 
 def load_fake_backends(max_backends: int = 3, prefer: Optional[List[str]] = None):
-    """Load a set of IBM fake backends from qiskit-ibm-runtime."""
+    """Load a set of IBM fake backends from qiskit-ibm-runtime.
+
+    Environment overrides:
+      - QDC_IBM_FAKE_BACKENDS=name1,name2,...
+      - QDC_IBM_FAKE_MAX_BACKENDS=2
+      - QDC_IBM_FAKE_SORT=largest|smallest|prefer
+      - QDC_IBM_FAKE_MIN_QUBITS=7
+      - QDC_IBM_FAKE_MAX_QUBITS=27
+    """
     backends = _discover_fake_backends()
     if not backends:
         raise ImportError(
@@ -83,23 +92,55 @@ def load_fake_backends(max_backends: int = 3, prefer: Optional[List[str]] = None
             "The installed qiskit-ibm-runtime may not include fakes."
         )
 
+    env_prefer = os.getenv("QDC_IBM_FAKE_BACKENDS")
+    if env_prefer:
+        prefer = [p.strip() for p in env_prefer.split(",") if p.strip()]
+
+    env_max = os.getenv("QDC_IBM_FAKE_MAX_BACKENDS")
+    if env_max:
+        try:
+            max_backends = int(env_max)
+        except ValueError:
+            pass
+
+    env_sort = os.getenv("QDC_IBM_FAKE_SORT", "").strip().lower()
+
+    def numq(b) -> int:
+        try:
+            return int(b.configuration().num_qubits)
+        except Exception:
+            return 0
+
+    env_min_q = os.getenv("QDC_IBM_FAKE_MIN_QUBITS")
+    if env_min_q:
+        try:
+            min_q = int(env_min_q)
+            backends = [b for b in backends if numq(b) >= min_q]
+        except ValueError:
+            pass
+
+    env_max_q = os.getenv("QDC_IBM_FAKE_MAX_QUBITS")
+    if env_max_q:
+        try:
+            max_q = int(env_max_q)
+            backends = [b for b in backends if numq(b) <= max_q]
+        except ValueError:
+            pass
+
     if prefer:
         prefer_l = [p.lower() for p in prefer]
 
-        def key(b):
+        def key_prefer(b):
             name = _backend_id(b).lower()
             hits = [i for i, s in enumerate(prefer_l) if s in name]
             best = min(hits) if hits else 10**9
-            return (best, name)
+            return (best, numq(b), name)
 
-        backends.sort(key=key)
+        backends.sort(key=key_prefer)
+    elif env_sort == "smallest":
+        backends.sort(key=lambda b: (numq(b), _backend_id(b)))
     else:
-        def numq(b) -> int:
-            try:
-                return int(b.configuration().num_qubits)
-            except Exception:
-                return 0
-
+        # Default stays compatible with old behavior: choose largest first.
         backends.sort(key=lambda b: (-numq(b), _backend_id(b)))
 
     return backends[: int(max_backends)]

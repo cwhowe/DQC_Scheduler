@@ -187,6 +187,38 @@ class Scheduler:
             return False
 
 
+    def _should_trace_wait_job(self, job_id: Optional[str]) -> bool:
+        raw = os.getenv("QDC_TRACE_WAIT_JOB_IDS", "").strip()
+        if not raw:
+            return False
+        wanted = {x.strip() for x in raw.split(",") if x.strip()}
+        return str(job_id) in wanted
+
+    def _trace_wait_plan(self, job_id: Optional[str], attempt: int, plan: Any) -> None:
+        if not (self._sched_debug_thrash() or self._should_trace_wait_job(job_id)):
+            return
+        try:
+            det = getattr(plan, "details", None) if plan is not None else None
+            det = det if isinstance(det, dict) else {}
+            reason = det.get("reason", "unknown")
+            max_free = det.get("max_connected_free_qubits", None)
+            reserved = det.get("reserved_qubits_sample", None)
+            plan_scores = det.get("plan_scores", None)
+            if isinstance(plan_scores, dict):
+                top_scores = sorted(
+                    ((k, (v or {}).get("score", None), (v or {}).get("pred_total_s", None)) for k, v in plan_scores.items()),
+                    key=lambda x: (float("inf") if x[1] is None else x[1], str(x[0]))
+                )[:6]
+            else:
+                top_scores = None
+            print(
+                f"[PENDING-WAIT] t={self.now_s:.3f} job={job_id} attempt={attempt} "
+                f"reason={reason} max_free={max_free} reserved={reserved} top_scores={top_scores}"
+            )
+        except Exception as e:
+            print(f"[PENDING-WAIT] t={self.now_s:.3f} job={job_id} attempt={attempt} trace_error={e!r}")
+
+
     def tick(self, dt_s: float) -> None:
         """Advance simulated time, release completed qubits, then retry pending jobs."""
         self.now_s += float(dt_s)
@@ -358,6 +390,7 @@ class Scheduler:
                 continue
 
             if plan.kind == "D_WAIT":
+                self._trace_wait_plan(jid, int(it.attempts), plan)
                 wb = self._wait_replan_backoff_s()
                 if wb > 0.0:
                     self._set_pending_backoff(jid, "wait", delay_s=wb)

@@ -159,12 +159,10 @@ class Planner:
         # -----------------
         # Plan B: cut, single QPU sequential
         # -----------------
-        skip_plan_b = (
-            _skip_plan_b_for_forced_wide
-            and bool(getattr(job.constraints, 'force_cutting', False))
-            and bool(getattr(job.constraints, 'allow_multi_qpu', False))
-            and int(getattr(prof, 'width', 0) or 0) > int(max_single_free)
-        )
+        # Do not hard-skip Plan B just because the intact circuit width exceeds
+        # the largest currently free connected block. Plan B is a cut sequential
+        # fallback and may still be feasible even when Plan C is temporarily infeasible.
+        skip_plan_b = False
         if allow_cut and skip_plan_b and _debug_plan_b:
             print(f"[PLAN-B-SKIP] job={job.job_id} reason=forced_wide_prefers_multi width={int(getattr(prof, 'width', 0) or 0)} max_single_free={int(max_single_free)}")
 

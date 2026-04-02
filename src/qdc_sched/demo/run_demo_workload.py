@@ -133,6 +133,9 @@ def make_workload(
     if pct_wide is None:
         pct_wide = float(os.getenv("QDC_PCT_WIDE", "0.15"))
 
+    disable_multi_qpu = os.getenv("QDC_DISABLE_MULTI_QPU", "0") == "1"
+    allow_multi_qpu = not disable_multi_qpu
+
     wl: List[Tuple[float, Job]] = []
     wide_ids: Set[str] = set()
     t = 0.0
@@ -172,7 +175,7 @@ def make_workload(
                 constraints=JobConstraints(
                     allow_cutting=True,
                     force_cutting=(os.getenv("QDC_FORCE_CUT_WIDE", "1") == "1"),
-                    allow_multi_qpu=True,
+                    allow_multi_qpu=allow_multi_qpu,
                     max_cuts=int(os.getenv("QDC_WIDE_MAX_CUTS", "2")),
                     comm_overhead_s=float(os.getenv("QDC_WIDE_COMM_OVERHEAD_S", "0.08")),
                 ),
@@ -210,7 +213,7 @@ def make_workload(
             constraints=JobConstraints(
                 allow_cutting=True,
                 force_cutting=force_cut,
-                allow_multi_qpu=True,
+                allow_multi_qpu=allow_multi_qpu,
                 max_cuts=int(os.getenv("QDC_MAX_CUTS", "6")),
                 comm_overhead_s=float(os.getenv("QDC_COMM_OVERHEAD_S", "0.02")),
             ),
@@ -391,6 +394,7 @@ def _active_reservations(qpus: Dict[str, QPUState], now_s: float) -> int:
 
 def run_workload(full_eval: bool = False) -> None:
     exclude_c = os.getenv("QDC_EXCLUDE_QPU_C", "1") == "1"
+    disable_multi_qpu = os.getenv("QDC_DISABLE_MULTI_QPU", "0") == "1"
     base_A = float(os.getenv("QDC_QPU_A_BASE_DELAY", "1.5"))
     base_B = float(os.getenv("QDC_QPU_B_BASE_DELAY", "0.2"))
     base_C = float(os.getenv("QDC_QPU_C_BASE_DELAY", "0.3"))
@@ -461,6 +465,7 @@ def run_workload(full_eval: bool = False) -> None:
 
     print("[DEMO] reserve_nonsim =", bool(getattr(sched.executor.cfg, "reserve_nonsim", False)))
     print("[DEMO] QDC_EXCLUDE_QPU_C =", exclude_c)
+    print("[DEMO] QDC_DISABLE_MULTI_QPU =", disable_multi_qpu)
 
     print("\n================ REAL WORKLOAD RUN ================")
     print("full_eval:", full_eval)
