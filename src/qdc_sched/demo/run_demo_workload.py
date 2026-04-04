@@ -585,6 +585,9 @@ def run_workload(full_eval: bool = False) -> None:
     print("wide_depths:", _parse_int_list("QDC_WIDE_DEPTHS", "16,24,32"))
     print("wide_shots:", _parse_int_list("QDC_WIDE_SHOTS", "500,1000,2000"))
     print("wide_align_to_bursts:", os.getenv("QDC_WIDE_ALIGN_TO_BURSTS", "1") == "1")
+    # print("step_dt_started_s:", step_dt_started_s)
+    # print("step_dt_idle_min_s:", step_dt_idle_min_s)
+    # print("step_dt_no_future_s:", step_dt_no_future_s)
 
     toggles = RunToggles(
         compute_estimated_fidelity=False,
@@ -598,6 +601,12 @@ def run_workload(full_eval: bool = False) -> None:
     max_steps = int(os.getenv("QDC_MAX_STEPS", "50000"))
     stop_reason = None
     max_to_schedule = int(os.getenv("QDC_MAX_TO_SCHEDULE", "2"))
+
+    # Debug / calibration knobs for scheduler time advancement.
+    # Smaller values reduce coarse-grained queue/start-delay artifacts.
+    step_dt_started_s = float(os.getenv("QDC_STEP_DT_STARTED_S", "0.5"))
+    step_dt_idle_min_s = float(os.getenv("QDC_STEP_DT_IDLE_MIN_S", "0.5"))
+    step_dt_no_future_s = float(os.getenv("QDC_STEP_DT_NO_FUTURE_S", "1.0"))
 
     step_wall_cap_s = float(os.getenv("QDC_STEP_WALL_CAP_S", "15.0"))
     idle_break_steps = int(os.getenv("QDC_IDLE_BREAK_STEPS", "5"))
@@ -622,8 +631,8 @@ def run_workload(full_eval: bool = False) -> None:
             max_to_schedule = max(1, max_to_schedule // 2)
             os.environ["QDC_MAX_TO_SCHEDULE"] = str(max_to_schedule)
             print(f"[WATCHDOG] adapting: setting QDC_MAX_TO_SCHEDULE={max_to_schedule} and continuing.")
-            sched.tick(0.5)
-            now += 0.5
+            sched.tick(step_dt_started_s)
+            now += step_dt_started_s
             continue
 
         if started:
@@ -642,7 +651,15 @@ def run_workload(full_eval: bool = False) -> None:
             stop_reason = f"idle_break_after_completion({idle_break_steps})"
             break
 
-        dt = 0.5 if started else (max(0.5, float(wl[next_idx][0] - now)) if next_idx < len(wl) else 1.0)
+        dt = (
+            step_dt_started_s
+            if started
+            else (
+                max(step_dt_idle_min_s, float(wl[next_idx][0] - now))
+                if next_idx < len(wl)
+                else step_dt_no_future_s
+            )
+        )
         sched.tick(dt)
         now += dt
 

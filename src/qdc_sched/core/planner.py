@@ -16,7 +16,7 @@ from ..cutting.base import CutConstraints
 from ..cutting import CutStrategy, QiskitAddonCutStrategy, FitCutCutStrategy
 from .hardware import QPUState
 from .quality import QualityModel
-from .runtime import estimate_qpu_execution_s, estimate_reconstruction_duration_s
+from .runtime import estimate_qpu_execution_s, estimate_reconstruction_duration_s, estimate_communication_duration_s
 from qdc_sched.cutting.assignment import MinMakespanGreedyAssignment
 from qdc_sched.core.profiler import profile_circuit
 
@@ -451,12 +451,28 @@ class Planner:
                     makespan = max(loads.values()) if loads else float('inf')
                 sampling = float(part.est_executions or 1.0)
                 per_qpu_wait_s = {}
+                per_qpu_wait_debug = {}
                 for qid in used_qpus:
                     assigned_labs = [lab for lab, q in assignment.items() if q == qid]
                     need_w = max(int(sub_profiles[lab].width) for lab in assigned_labs) if assigned_labs else int(prof.width)
                     base_d = float(getattr(self.qpus[qid].profile, 'base_queue_delay_s', 0.0) or 0.0)
                     start_probe_s = float(now_s) + float(base_d)
-                    per_qpu_wait_s[qid] = base_d + _wait_s(qid, need_w, start_probe_s)
+                    raw_wait = float(_wait_s(qid, need_w, start_probe_s))
+                    total_wait = base_d + raw_wait
+                    per_qpu_wait_s[qid] = total_wait
+                    try:
+                        max_free_now = int(self.qpus[qid].max_connected_free_qubits(now_s))
+                    except Exception:
+                        max_free_now = None
+                    per_qpu_wait_debug[qid] = {
+                        "assigned_labels": list(assigned_labs),
+                        "need_width": int(need_w),
+                        "base_delay_s": float(base_d),
+                        "start_probe_s": float(start_probe_s),
+                        "raw_wait_s": float(raw_wait),
+                        "total_wait_s": float(total_wait),
+                        "max_connected_free_qubits_now": max_free_now,
+                    }
 
                 pred_finish = 0.0
                 for qid in used_qpus:
@@ -466,14 +482,19 @@ class Planner:
                 recon_est, recon_meta = self._predict_host_reconstruction_s(sampling)
 
                 used_qpus_list = sorted(list(used_qpus))
-                pred_comm = float(job.constraints.comm_overhead_s or 0.0) if len(used_qpus_list) >= 2 else 0.0
+                pred_comm, comm_meta = estimate_communication_duration_s(
+                    num_subexperiments=float(sampling),
+                    num_samples=float(sampling),
+                    n_qpus_used=float(len(used_qpus_list)),
+                    plan_kind="C_CUT_MULTI_QPU",
+                )
                 pred_queue = max(float(per_qpu_wait_s.get(qid, 0.0)) for qid in used_qpus_list) if used_qpus_list else 0.0
                 pred_exec = max(
                     sum(float(label_qpu_pred_time[lab][qid]) for lab, q in assignment.items() if q == qid)
                     for qid in used_qpus_list
                 ) if used_qpus_list else float('inf')
                 pred_recon = float(recon_est)
-                pred_total = float(pred_finish) + pred_comm
+                pred_total = float(pred_finish) + float(pred_comm)
                 if not _planner_ignore_recon:
                     pred_total += pred_recon
                 fid_proxy = max(float(self.quality.fidelity_proxy_from_profile(qid, prof)) for qid in used_qpus_list)
@@ -483,7 +504,8 @@ class Planner:
                         f"[PLAN-C-CAND] job={job.job_id} pair={candidates_qpus} used={used_qpus_list} "
                         f"labels={len(labels)} sampling={sampling:.3f} "
                         f"pred_queue={pred_queue:.6f} pred_exec={pred_exec:.6f} "
-                        f"pred_comm={pred_comm:.6f} pred_recon={pred_recon:.6f} total={pred_total:.6f}"
+                        f"pred_comm={pred_comm:.6f} pred_recon={pred_recon:.6f} total={pred_total:.6f} "
+                        f"per_qpu_wait={per_qpu_wait_debug}"
                     )
 
                 candidates.append(Plan(
@@ -498,6 +520,7 @@ class Planner:
                         "sampling_overhead": float(sampling),
                         "pred_recon_s": pred_recon,
                         "pred_comm_s": pred_comm,
+                        "comm_timing_meta": comm_meta,
                         "qpu_candidates": list(candidates_qpus),
                         "used_qpus": used_qpus_list,
                         "subset_signature": "+".join(sorted(used_qpus_list)),
@@ -506,6 +529,7 @@ class Planner:
                         "predicted_makespan_s": float(pred_exec),
                         "wait_est_s": float(pred_queue),
                         "per_qpu_wait_s": dict(per_qpu_wait_s),
+                        "per_qpu_wait_debug": dict(per_qpu_wait_debug),
                         "k_wire": int(getattr(part, "k_wire", 0) or 0),
                         "k_gate": int(getattr(part, "k_gate", 0) or 0),
                         "assignment": assignment,
@@ -517,6 +541,46 @@ class Planner:
                         "recon_timing_meta": recon_meta,
                     },
                 ))
+        # -----------------
+        # Optional naive baseline policies
+        # -----------------
+        baseline_policy = os.getenv("QDC_BASELINE_POLICY", "").strip().lower()
+        if baseline_policy in ("first_feasible", "greedy_first_feasible", "naive_greedy"):
+            slo = job.constraints.slo_s
+
+            def _kind_rank(plan_kind: str) -> int:
+                order = {
+                    "A_NO_CUT_SINGLE": 0,
+                    "B_CUT_SINGLE_SEQ": 1,
+                    "C_CUT_MULTI_QPU": 2,
+                    "D_WAIT": 99,
+                }
+                return order.get(str(plan_kind), 50)
+
+            feasible = []
+            for plan in candidates:
+                if slo is not None and float(plan.predicted_total_time_s) > float(slo):
+                    continue
+                feasible.append(plan)
+
+            feasible.sort(
+                key=lambda p: (
+                    _kind_rank(getattr(p, "kind", "")),
+                    float(getattr(p, "predicted_total_time_s", float("inf"))),
+                )
+            )
+
+            if feasible:
+                chosen = feasible[0]
+                if chosen.details is None:
+                    chosen.details = {}
+                chosen.details.setdefault("baseline_policy", baseline_policy)
+                chosen.details.setdefault(
+                    "baseline_note",
+                    "Naive greedy baseline: fixed preference A > B > C, choosing the lowest predicted total within the first feasible class.",
+                )
+                return chosen
+
         # -----------------
         # Score + SLO filter
         # -----------------
