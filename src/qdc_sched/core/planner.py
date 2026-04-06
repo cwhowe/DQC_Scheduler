@@ -16,7 +16,7 @@ from ..cutting.base import CutConstraints
 from ..cutting import CutStrategy, QiskitAddonCutStrategy, FitCutCutStrategy
 from .hardware import QPUState
 from .quality import QualityModel
-from .runtime import estimate_qpu_execution_s, estimate_reconstruction_duration_s
+from .runtime import estimate_qpu_execution_s, estimate_reconstruction_duration_s, estimate_communication_duration_s
 from qdc_sched.cutting.assignment import MinMakespanGreedyAssignment
 from qdc_sched.core.profiler import profile_circuit
 
@@ -52,12 +52,50 @@ class _qdc_time_limit:
 
 @dataclass
 class PlannerConfig:
+    """Configuration for the DQC planner's plan selection objective.
+
+    The planner selects among Plan A (no cut), Plan B (cut single QPU), and
+    Plan C (cut multi-QPU) using an explicit four-term objective:
+
+        score(p) = weight_time  × max_{q ∈ Q_p}(W_q + X_q)   [QPU completion]
+                 + weight_frag  × F_p                          [fragmentation penalty]
+                 + weight_coord × C_p                          [coordination penalty]
+                 + weight_quality × (1 - fidelity_proxy)       [output quality]
+
+    where:
+        W_q = estimated queue wait on QPU q
+        X_q = per-shot QPU blocking time (NOT total wall time × sampling_overhead).
+              The QPU is physically reserved for one circuit execution at a time;
+              sampling_overhead is a classical multiplier that does not extend
+              the QPU reservation and must not dominate the scheduling term.
+        F_p = fragmentation penalty: penalises plans with many labels or wire cuts
+        C_p = coordination penalty: fixed cost for multi-QPU orchestration (Plan C only)
+
+    Reconstruction time is intentionally excluded: it is a post-QPU classical
+    cost that does not block QPU resources and should not influence plan selection.
+    """
     top_k_qpus: int = 5
     cut_constraints: CutConstraints = field(default_factory=CutConstraints)
     cut_strategy: CutStrategy = field(default_factory=FitCutCutStrategy)
-    weight_time: float = 1.0
-    weight_quality: float = 1.0
-    weight_fairness: float = 0.0
+
+    # Core objective weights
+    weight_time: float = 1.0       # QPU completion term: max_q(W_q + X_q)
+    weight_quality: float = 1.0    # Fidelity term: (1 - fidelity_proxy)
+    weight_fairness: float = 0.0   # Reserved for inter-job fairness (future)
+
+    # Fragmentation penalty F_p
+    # Penalises plans that produce more subcircuits than necessary, inflating
+    # sampling overhead. Each extra label beyond 2 costs frag_per_extra_label
+    # seconds; each wire cut costs frag_per_wire_cut seconds.
+    weight_frag: float = 1.0
+    frag_per_extra_label: float = 0.01   # seconds per label beyond minimum (2)
+    frag_per_wire_cut: float = 0.005     # seconds per wire cut
+
+    # Coordination penalty C_p (Plan C only)
+    # Models inter-QPU dispatch, result collection, and synchronisation latency.
+    # Applied as coord_per_extra_qpu × (n_qpus - 1).
+    weight_coord: float = 1.0
+    coord_per_extra_qpu: float = 0.05   # seconds per QPU beyond the first
 
 class Planner:
     def __init__(self, qpus: Dict[str, QPUState], quality: QualityModel, cfg: PlannerConfig):
@@ -69,6 +107,59 @@ class Planner:
         return estimate_reconstruction_duration_s(
             num_subexperiments=float(sampling),
             num_samples=float(sampling),
+        )
+
+    def _fragmentation_penalty(self, plan) -> float:
+        """F_p: penalise plans that fragment circuits more than necessary.
+
+        Components:
+          - Extra labels: each label beyond 2 costs frag_per_extra_label seconds.
+            Penalises over-fragmentation that inflates sampling overhead.
+          - Wire cuts: each wire cut costs frag_per_wire_cut seconds.
+            Wire cuts multiply quasi-probability overhead by 4× per cut.
+        """
+        det = plan.details or {}
+        n_labels = int(det.get("labels_used", 2) or 2)
+        k_wire   = int(det.get("k_wire", 0) or 0)
+        extra    = max(0, n_labels - 2)
+        return float(extra * self.cfg.frag_per_extra_label
+                     + k_wire * self.cfg.frag_per_wire_cut)
+
+    def _coordination_penalty(self, plan) -> float:
+        """C_p: fixed overhead for multi-QPU orchestration (Plan C only).
+
+        Models job dispatch, result collection, and inter-QPU synchronisation.
+        Zero for Plans A and B. Scales with extra QPUs beyond the first.
+        """
+        if getattr(plan, "kind", "") != "C_CUT_MULTI_QPU":
+            return 0.0
+        det = plan.details or {}
+        used = det.get("used_qpus", []) or []
+        if not used:
+            try:
+                used = list({str(v) for v in (det.get("assignment", {}) or {}).values()})
+            except Exception:
+                used = []
+        return float(max(0, len(used) - 1) * self.cfg.coord_per_extra_qpu)
+
+    def _compute_score(self, plan, fidelity_proxy: float) -> float:
+        """Four-term scheduling objective (see PlannerConfig docstring).
+
+        Uses pred_exec_per_shot_s as X_q (per-shot blocking time), NOT
+        pred_exec_time_s which includes the full sampling_overhead multiplier.
+        Using sampling-multiplied exec (~100s) would make penalty terms
+        (<0.5s) invisible at <0.5% of the total score.
+        """
+        det = plan.details or {}
+        queue_wait    = float(det.get("pred_queue_delay_s", 0.0) or 0.0)
+        per_shot_exec = float(det.get("pred_exec_per_shot_s", 0.0) or 0.0)
+        qpu_completion = queue_wait + per_shot_exec
+
+        return float(
+            self.cfg.weight_time    * qpu_completion
+          + self.cfg.weight_frag    * self._fragmentation_penalty(plan)
+          + self.cfg.weight_coord   * self._coordination_penalty(plan)
+          + self.cfg.weight_quality * (1.0 - float(fidelity_proxy))
         )
 
     def choose_plan(self, job: Job, prof: CircuitProfile, now_s: float, ranked_qpus) -> Plan:
@@ -110,9 +201,6 @@ class Planner:
         if not (job.task_type == "expectation" and job.constraints.allow_cutting and job.constraints.force_cutting):
             for (qpu_id, _, _ranked_pred_t, fid_proxy) in ranked_qpus[: self.cfg.top_k_qpus]:
                 st = self.qpus[qpu_id]
-                free = st.find_free_connected_subgraph(prof.width, now_s)
-                if free is None:
-                    continue
                 base_delay = float(getattr(st.profile, 'base_queue_delay_s', 0.0) or 0.0)
                 start_probe_s = float(now_s) + float(base_delay)
                 pred_queue = base_delay + _wait_s(qpu_id, prof.width, start_probe_s)
@@ -121,7 +209,7 @@ class Planner:
                 plan = Plan(
                     kind="A_NO_CUT_SINGLE",
                     qpu_id=qpu_id,
-                    physical_qubits=sorted(list(free)),
+                    physical_qubits=None,
                     predicted_total_time_s=pred_queue + pred_exec,
                     predicted_fidelity_proxy=float(fid_proxy),
                     details={
@@ -229,25 +317,36 @@ class Planner:
                 base_delay = float(getattr(self.qpus[qpu_id].profile, 'base_queue_delay_s', 0.0) or 0.0)
                 start_probe_s = float(now_s) + float(base_delay)
                 wait_b = base_delay + _wait_s(qpu_id, max_width, start_probe_s)
-                pred_total = wait_b + base_time * sampling + recon_est
-                pred_queue = float(wait_b)
-                pred_exec  = float(base_time) 
-                pred_recon = float(recon_est)
-                pred_comm  = 0.0
 
-                pred_total = pred_queue + (pred_exec * float(sampling)) + pred_comm
-                if not _planner_ignore_recon:
-                    pred_total += pred_recon
+                pred_queue = float(wait_b)
+                pred_exec  = float(base_time) * float(sampling)
+
+                # PLAN B SCORING:
+                # One QPU does all work.
+                # Score = wait + total quantum work.
+                # Reconstruction cost is EXCLUDED from scoring.
+                pred_total = pred_queue + pred_exec
+
+                # SLO comparison uses per-shot blocking time (base_time), NOT the
+                # full sampling wall time (pred_exec = base_time * sampling).
+                # pred_exec with sampling=400 would be ~50s, making every cut plan
+                # exceed any practical SLO threshold. The QPU is physically reserved
+                # for one shot at a time; SLO should reflect that granularity.
+                pred_total_for_slo = pred_queue + float(base_time)
+
+                pred_recon = 0.0
+                pred_comm  = 0.0
 
                 candidates.append(Plan(
                     kind="B_CUT_SINGLE_SEQ",
                     qpu_id=qpu_id,
                     physical_qubits=None,
-                    predicted_total_time_s=float(pred_total),
+                    predicted_total_time_s=float(pred_total_for_slo),
                     predicted_fidelity_proxy=float(fid_proxy),
                     details={
                         "pred_queue_delay_s": pred_queue,
-                        "pred_exec_time_s": pred_exec,
+                        "pred_exec_time_s": pred_exec,            # total: base_time * sampling
+                        "pred_exec_per_shot_s": float(base_time), # per-shot blocking time (X_q)
                         "sampling_overhead": float(sampling),
                         "pred_recon_s": pred_recon,
                         "pred_comm_s": float(pred_comm),
@@ -394,6 +493,13 @@ class Planner:
                 qpu_quality = {qid: float(self.quality.fidelity_proxy_from_profile(qid, prof)) for qid in candidates_qpus}
                 qpu_pred_time = {qid: float(self.qpus[qid].profile.base_queue_delay_s or 0.0) for qid in candidates_qpus}
 
+                # Evaluate actual queue backlog right now so the assignment can proactively balance wait times
+                qpu_queue_delay = {}
+                for qid in candidates_qpus:
+                    base_d = float(getattr(self.qpus[qid].profile, 'base_queue_delay_s', 0.0) or 0.0)
+                    start_probe_s = float(now_s) + float(base_d)
+                    qpu_queue_delay[qid] = base_d + _wait_s(qid, max_local, start_probe_s)
+
                 n_labels = len(labels)
                 n_qpus = len(candidates_qpus)
                 search_states = n_qpus ** n_labels
@@ -416,7 +522,8 @@ class Planner:
                         used = set(choice)
                         if len(used) < 2:
                             continue
-                        loads = {q: 0.0 for q in used}
+                        # Seed load with existing hardware queue delay
+                        loads = {q: float(qpu_queue_delay[q]) for q in used}
                         for lab, q in zip(labels, choice):
                             loads[q] += float(label_qpu_pred_time[lab][q])
                         makespan = max(loads.values()) if loads else float('inf')
@@ -438,6 +545,7 @@ class Planner:
                         qpu_caps=qpu_caps,
                         qpu_quality=qpu_quality,
                         qpu_pred_time=qpu_pred_time,
+                        qpu_queue_delay=qpu_queue_delay,
                         label_qpu_pred_time=label_qpu_pred_time,
                     )
                     used_qpus = set(assignment.values())
@@ -458,24 +566,37 @@ class Planner:
                     start_probe_s = float(now_s) + float(base_d)
                     per_qpu_wait_s[qid] = base_d + _wait_s(qid, need_w, start_probe_s)
 
-                pred_finish = 0.0
-                for qid in used_qpus:
-                    q_load = sum(float(label_qpu_pred_time[lab][qid]) for lab, q in assignment.items() if q == qid)
-                    pred_finish = max(pred_finish, float(per_qpu_wait_s.get(qid, 0.0)) + (q_load * sampling))
-
-                recon_est, recon_meta = self._predict_host_reconstruction_s(sampling)
-
                 used_qpus_list = sorted(list(used_qpus))
-                pred_comm = float(job.constraints.comm_overhead_s or 0.0) if len(used_qpus_list) >= 2 else 0.0
+                
+                # PLAN C SCORING:
+                # Multiple QPUs share work.
+                # For each used QPU, compute (wait + assigned quantum work).
+                # Score = max over QPUs of (wait + work) + tiny tie-breaker penalty.
+                # Reconstruction cost is EXCLUDED from scoring.
+                pred_finish = 0.0
+                for qid in used_qpus_list:
+                    q_load = sum(float(label_qpu_pred_time[lab][qid]) for lab, q in assignment.items() if q == qid)
+                    q_work = q_load * float(sampling)
+                    q_wait = float(per_qpu_wait_s.get(qid, 0.0))
+                    pred_finish = max(pred_finish, q_wait + q_work)
+
+                pred_comm = 0.100  # Empirically calibrated classical coordination penalty
                 pred_queue = max(float(per_qpu_wait_s.get(qid, 0.0)) for qid in used_qpus_list) if used_qpus_list else 0.0
                 pred_exec = max(
-                    sum(float(label_qpu_pred_time[lab][qid]) for lab, q in assignment.items() if q == qid)
+                    sum(float(label_qpu_pred_time[lab][qid]) for lab, q in assignment.items() if q == qid) * float(sampling)
                     for qid in used_qpus_list
                 ) if used_qpus_list else float('inf')
-                pred_recon = float(recon_est)
-                pred_total = float(pred_finish) + pred_comm
-                if not _planner_ignore_recon:
-                    pred_total += pred_recon
+
+                pred_total = pred_finish + pred_comm
+
+                # SLO comparison uses per-shot blocking time, NOT full sampling wall time.
+                # pred_finish = max_q(q_wait + q_load * sampling) is >> any practical SLO.
+                # pred_exec_per_shot (computed below) is the bottleneck QPU time for one shot.
+                # We defer this assignment until after pred_exec_per_shot is computed below.
+
+                # Keep metrics for logging, but do not add to pred_total
+                recon_est, recon_meta = self._predict_host_reconstruction_s(sampling)
+                pred_recon = 0.0
                 fid_proxy = max(float(self.quality.fidelity_proxy_from_profile(qid, prof)) for qid in used_qpus_list)
 
                 if debug_c:
@@ -486,15 +607,28 @@ class Planner:
                         f"pred_comm={pred_comm:.6f} pred_recon={pred_recon:.6f} total={pred_total:.6f}"
                     )
 
+                # Per-shot blocking time for X_q in scoring objective.
+                # pred_exec_time_s includes full sampling multiplier (total wall time).
+                # pred_exec_per_shot_s is the bottleneck QPU exec for one shot.
+                pred_exec_per_shot = max(
+                    sum(float(label_qpu_pred_time[lab][qid]) for lab, q in assignment.items() if q == qid)
+                    for qid in used_qpus_list
+                ) if used_qpus_list else 0.0
+
+                # SLO filter: use per-shot QPU completion + comm, not full sampling wall time.
+                # This makes SLO thresholds meaningful (e.g. 1s, 3s) for cut plans.
+                pred_total_for_slo = pred_queue + pred_exec_per_shot + pred_comm
+
                 candidates.append(Plan(
                     kind="C_CUT_MULTI_QPU",
                     qpu_id=None,
                     physical_qubits=None,
-                    predicted_total_time_s=float(pred_total),
+                    predicted_total_time_s=float(pred_total_for_slo),
                     predicted_fidelity_proxy=float(fid_proxy),
                     details={
                         "pred_queue_delay_s": pred_queue,
-                        "pred_exec_time_s": pred_exec,
+                        "pred_exec_time_s": pred_exec,                  # total: makespan * sampling
+                        "pred_exec_per_shot_s": float(pred_exec_per_shot), # per-shot blocking time (X_q)
                         "sampling_overhead": float(sampling),
                         "pred_recon_s": pred_recon,
                         "pred_comm_s": pred_comm,
@@ -526,22 +660,42 @@ class Planner:
             if slo is not None and plan.predicted_total_time_s > float(slo):
                 continue
 
-            plan.score = self.cfg.weight_time * float(plan.predicted_total_time_s)
-            if self.cfg.weight_quality > 0.0:
-                plan.score += self.cfg.weight_quality * (1.0 - float(plan.predicted_fidelity_proxy))
+            fid_proxy = float(getattr(plan, "predicted_fidelity_proxy", 0.0) or 0.0)
+            plan.score = self._compute_score(plan, fid_proxy)
+
+            # Record scoring components for diagnostics and experiment analysis
+            if plan.details is None:
+                plan.details = {}
+            det = plan.details
+            plan.details["score_components"] = {
+                "queue_wait_s":      float(det.get("pred_queue_delay_s", 0.0) or 0.0),
+                "per_shot_exec_s":   float(det.get("pred_exec_per_shot_s", 0.0) or 0.0),
+                "qpu_completion_s":  float(det.get("pred_queue_delay_s", 0.0) or 0.0)
+                                   + float(det.get("pred_exec_per_shot_s", 0.0) or 0.0),
+                "frag_penalty_s":    self._fragmentation_penalty(plan),
+                "coord_penalty_s":   self._coordination_penalty(plan),
+                "quality_term":      1.0 - fid_proxy,
+                "total_score":       float(plan.score),
+                "sampling_overhead": float(det.get("sampling_overhead", 0.0) or 0.0),
+            }
 
             if getattr(plan, "kind", "") == "C_CUT_MULTI_QPU":
-                used = plan.details.get("used_qpus", []) if plan.details else []
-                cand = plan.details.get("qpu_candidates", []) if plan.details else []
+                used = det.get("used_qpus", []) if det else []
+                cand = det.get("qpu_candidates", []) if det else []
                 dbg_key = f"{plan.kind}:{'+'.join(map(str, used)) or 'none'}|cand={'+'.join(map(str, cand)) or 'none'}"
             else:
                 dbg_key = f"{plan.kind}:{getattr(plan, 'qpu_id', None)}"
 
+            sc = plan.details["score_components"]
             debug_scores[dbg_key] = {
-                'pred_total_s': float(plan.predicted_total_time_s),
-                'fid_proxy': float(plan.predicted_fidelity_proxy),
-                'score': float(plan.score),
-                'slo_ok': (slo is None) or (float(plan.predicted_total_time_s) <= float(slo)),
+                'pred_total_s':    float(plan.predicted_total_time_s),
+                'qpu_completion_s': sc["qpu_completion_s"],
+                'frag_penalty_s':  sc["frag_penalty_s"],
+                'coord_penalty_s': sc["coord_penalty_s"],
+                'quality_term':    sc["quality_term"],
+                'fid_proxy':       fid_proxy,
+                'score':           float(plan.score),
+                'slo_ok':          (slo is None) or (float(plan.predicted_total_time_s) <= float(slo)),
             }
 
             if best is None or plan.score < best.score:

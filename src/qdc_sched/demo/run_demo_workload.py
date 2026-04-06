@@ -28,9 +28,14 @@ def ghz(n: int, measure: bool = True) -> QuantumCircuit:
     return qc
 
 
-def random_cx(n: int, depth: int, measure: bool = True) -> QuantumCircuit:
+def random_cx(
+    n: int,
+    depth: int,
+    measure: bool = True,
+    rng: random.Random | None = None,
+) -> QuantumCircuit:
     qc = QuantumCircuit(n)
-    rng = random.Random(1234 + 17 * n + depth)
+    rng = rng or random.Random(1234 + 17 * n + depth)
     for _ in range(depth):
         a = rng.randrange(n)
         b = rng.randrange(n)
@@ -85,17 +90,111 @@ def _parse_float_list(env_name: str, default_csv: str) -> List[float]:
     return out
 
 
+
+
+def _parse_str_list(env_name: str, default_csv: str = "") -> List[str]:
+    raw = os.getenv(env_name, default_csv)
+    out: List[str] = []
+    for x in raw.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        out.append(x)
+    return out
+
+
+def _logical_qpu_slot_names(n: int) -> List[str]:
+    """
+    Generate logical scheduler-facing slot names:
+      qpu_A, qpu_B, ..., qpu_Z, qpu_27, qpu_28, ...
+    """
+    names: List[str] = []
+    for i in range(n):
+        if i < 26:
+            names.append(f"qpu_{chr(ord('A') + i)}")
+        else:
+            names.append(f"qpu_{i + 1}")
+    return names
+
+
+def _apply_demo_base_delay_overrides(qpus: Dict[str, QPUState]) -> None:
+    """
+    Apply optional demo-level base-delay overrides to any logical slot.
+
+    Supported forms:
+      - legacy per-slot envs: QDC_QPU_A_BASE_DELAY, QDC_QPU_B_BASE_DELAY, ...
+      - generic env per logical slot: QDC_QPU_qpu_A_BASE_DELAY, etc.
+      - CSV list in slot order: QDC_QPU_BASE_DELAYS=1.5,0.2,0.3,0.3
+    """
+    csv_raw = os.getenv("QDC_QPU_BASE_DELAYS", "").strip()
+    csv_delays = [float(x.strip()) for x in csv_raw.split(",") if x.strip()] if csv_raw else []
+    slot_names = sorted(qpus.keys())
+
+    for idx, slot in enumerate(slot_names):
+        override = None
+
+        generic_env = f"QDC_QPU_{slot}_BASE_DELAY"
+        if os.getenv(generic_env) is not None:
+            try:
+                override = float(os.getenv(generic_env, "0.0"))
+            except Exception:
+                override = None
+
+        if override is None and slot.startswith("qpu_"):
+            suffix = slot.split("_", 1)[1]
+            legacy_env = f"QDC_QPU_{suffix}_BASE_DELAY"
+            if os.getenv(legacy_env) is not None:
+                try:
+                    override = float(os.getenv(legacy_env, "0.0"))
+                except Exception:
+                    override = None
+
+        if override is None and idx < len(csv_delays):
+            override = float(csv_delays[idx])
+
+        if override is not None:
+            try:
+                qpus[slot].profile.base_queue_delay_s = override
+            except Exception:
+                pass
+
+
+def _remap_qpu_slots(
+    qpus_by_backend: Dict[str, QPUState],
+    noise_models_by_backend: Dict[str, object],
+) -> Tuple[Dict[str, QPUState], Dict[str, object]]:
+    """
+    Remap backend-id keyed IBM fake QPUs onto logical demo slots qpu_A, qpu_B, ...
+
+    Important:
+    - dict keys become logical slot names for scheduler/demo logic
+    - profile.qpu_id remains the underlying backend id (e.g., fake_casablanca)
+      so exported records still reflect the real backend used
+    """
+    items = list(qpus_by_backend.items())
+    slot_names = _logical_qpu_slot_names(len(items))
+
+    qpus: Dict[str, QPUState] = {}
+    noise_models: Dict[str, object] = {}
+
+    for slot_name, (backend_id, qpu_state) in zip(slot_names, items):
+        qpus[slot_name] = qpu_state
+        if backend_id in noise_models_by_backend:
+            noise_models[slot_name] = noise_models_by_backend[backend_id]
+
+    return qpus, noise_models
+
 def build_expectation_circuit(n: int, rng: random.Random, *, family: str, depth: int | None = None) -> QuantumCircuit:
     fam = (family or "ghz").strip().lower()
     if fam == "ghz":
         return ghz(n, measure=False)
     if fam in ("random_cx", "randcx", "cx"):
         d = int(depth if depth is not None else max(4, 2 * n))
-        return random_cx(n, d, measure=False)
+        return random_cx(n, d, measure=False, rng=rng)
     if fam in ("ghz_then_mix", "hybrid"):
         qc = ghz(n, measure=False)
         d = int(depth if depth is not None else max(4, n))
-        mix = random_cx(n, d, measure=False)
+        mix = random_cx(n, d, measure=False, rng=rng)
         qc.compose(mix, inplace=True)
         return qc
     raise ValueError(f"Unsupported QDC_WIDE_FAMILY={family!r}")
@@ -133,13 +232,16 @@ def make_workload(
     if pct_wide is None:
         pct_wide = float(os.getenv("QDC_PCT_WIDE", "0.15"))
 
+    disable_cutting = os.getenv("QDC_DISABLE_CUTTING", "0") == "1"
     disable_multi_qpu = os.getenv("QDC_DISABLE_MULTI_QPU", "0") == "1"
+    allow_cutting = not disable_cutting
     allow_multi_qpu = not disable_multi_qpu
 
     wl: List[Tuple[float, Job]] = []
     wide_ids: Set[str] = set()
     t = 0.0
-    rng = random.Random(2026)
+    seed = int(os.getenv("QDC_SEED", "2026"))
+    rng = random.Random(seed)
 
     n_wide = int(round(n_jobs * pct_wide))
     wide_slots = set(rng.sample(range(n_jobs), k=n_wide)) if n_wide > 0 else set()
@@ -173,7 +275,7 @@ def make_workload(
                 shots=shots,
                 submit_time_s=submit_t,
                 constraints=JobConstraints(
-                    allow_cutting=True,
+                    allow_cutting=allow_cutting,
                     force_cutting=(os.getenv("QDC_FORCE_CUT_WIDE", "1") == "1"),
                     allow_multi_qpu=allow_multi_qpu,
                     max_cuts=int(os.getenv("QDC_WIDE_MAX_CUTS", "2")),
@@ -188,7 +290,7 @@ def make_workload(
             width = rng.choice([3, 5, 7])
             depth = rng.choice([3, 6, 9])
             shots = rng.choice([500, 1000, 2000])
-            qc = random_cx(width, depth, measure=True)
+            qc = random_cx(width, depth, measure=True, rng=rng)
             job = Job(job_id=jid, circuit=qc, task_type="counts", shots=shots, submit_time_s=t)
             wl.append((t, job))
             continue
@@ -211,7 +313,7 @@ def make_workload(
             shots=shots,
             submit_time_s=t,
             constraints=JobConstraints(
-                allow_cutting=True,
+                allow_cutting=allow_cutting,
                 force_cutting=force_cut,
                 allow_multi_qpu=allow_multi_qpu,
                 max_cuts=int(os.getenv("QDC_MAX_CUTS", "6")),
@@ -394,25 +496,27 @@ def _active_reservations(qpus: Dict[str, QPUState], now_s: float) -> int:
 
 def run_workload(full_eval: bool = False) -> None:
     exclude_c = os.getenv("QDC_EXCLUDE_QPU_C", "1") == "1"
+    disable_cutting = os.getenv("QDC_DISABLE_CUTTING", "0") == "1"
     disable_multi_qpu = os.getenv("QDC_DISABLE_MULTI_QPU", "0") == "1"
-    base_A = float(os.getenv("QDC_QPU_A_BASE_DELAY", "1.5"))
-    base_B = float(os.getenv("QDC_QPU_B_BASE_DELAY", "0.2"))
-    base_C = float(os.getenv("QDC_QPU_C_BASE_DELAY", "0.3"))
 
     qpu_source = os.getenv("QDC_QPU_SOURCE", "line").strip().lower()
 
     if qpu_source == "ibm_fake":
-        qpus, _noise_models = make_ibm_fake_qpu_set()
+        selected_backends = _parse_str_list("QDC_IBM_FAKE_BACKENDS", "")
+        max_backends = max(1, len(selected_backends)) if selected_backends else 3
+
+        raw_qpus, raw_noise_models = make_ibm_fake_qpu_set(
+            max_backends=max_backends,
+            prefer=selected_backends if selected_backends else None,
+        )
+
+        qpus, _noise_models = _remap_qpu_slots(raw_qpus, raw_noise_models)
+
         if exclude_c and "qpu_C" in qpus:
             del qpus["qpu_C"]
-        # Preserve demo-level base-delay overrides on the returned profiles.
-        try:
-            qpus["qpu_A"].profile.base_queue_delay_s = float(base_A)
-            qpus["qpu_B"].profile.base_queue_delay_s = float(base_B)
-            if not exclude_c and "qpu_C" in qpus:
-                qpus["qpu_C"].profile.base_queue_delay_s = float(base_C)
-        except Exception:
-            pass
+            _noise_models.pop("qpu_C", None)
+
+        _apply_demo_base_delay_overrides(qpus)
     else:
         qpu_source = os.getenv("QDC_QPU_SOURCE", "line").strip().lower()
 
@@ -422,22 +526,17 @@ def run_workload(full_eval: bool = False) -> None:
             if exclude_c and "qpu_C" in qpus:
                 del qpus["qpu_C"]
 
-            try:
-                if "qpu_A" in qpus:
-                    qpus["qpu_A"].profile.base_queue_delay_s = float(base_A)
-                if "qpu_B" in qpus:
-                    qpus["qpu_B"].profile.base_queue_delay_s = float(base_B)
-                if not exclude_c and "qpu_C" in qpus:
-                    qpus["qpu_C"].profile.base_queue_delay_s = float(base_C)
-            except Exception:
-                pass
+            _apply_demo_base_delay_overrides(qpus)
         else:
-            qpus: Dict[str, QPUState] = {
-                "qpu_A": make_line_qpu("qpu_A", 7, base_queue_delay_s=base_A),
-                "qpu_B": make_line_qpu("qpu_B", 7, base_queue_delay_s=base_B),
-            }
-            if not exclude_c:
-                qpus["qpu_C"] = make_line_qpu("qpu_C", 14, base_queue_delay_s=base_C)
+            line_sizes = _parse_int_list("QDC_LINE_QPU_SIZES", "7,7,14")
+            slot_names = _logical_qpu_slot_names(len(line_sizes))
+            qpus: Dict[str, QPUState] = {}
+            for slot, nqubits in zip(slot_names, line_sizes):
+                if exclude_c and slot == "qpu_C":
+                    continue
+                qpus[slot] = make_line_qpu(slot, int(nqubits), base_queue_delay_s=0.3)
+
+            _apply_demo_base_delay_overrides(qpus)
 
     reserve_counts = _install_reserve_counters(qpus)
     inject_congestion_bursts(qpus)
@@ -458,20 +557,36 @@ def run_workload(full_eval: bool = False) -> None:
         aer_timing_include_transpile=(os.getenv("QDC_AER_TIMING_INCLUDE_TRANSPILE", "0") == "1"),
     )
 
-    sched = Scheduler(qpus=qpus, quality=QualityModel(noise_models={}), cfg=cfg)
+    sched = Scheduler(
+        qpus=qpus,
+        quality=QualityModel(
+            noise_models={},
+            # Pass per-QPU HardwareProfiles so the fidelity proxy uses real
+            # per-device error rates rather than global fallback constants.
+            qpu_profiles={qid: st.profile for qid, st in qpus.items()},
+        ),
+        cfg=cfg,
+    )
 
     wl, wide_ids = make_workload()
     plan_ctr = _install_plan_debug(sched, wide_ids)
 
     print("[DEMO] reserve_nonsim =", bool(getattr(sched.executor.cfg, "reserve_nonsim", False)))
     print("[DEMO] QDC_EXCLUDE_QPU_C =", exclude_c)
+    print("[DEMO] QDC_DISABLE_CUTTING =", disable_cutting)
     print("[DEMO] QDC_DISABLE_MULTI_QPU =", disable_multi_qpu)
+    try:
+        chosen_ids = {slot: qpus[slot].profile.qpu_id for slot in sorted(qpus.keys())}
+        print("[DEMO] active backend pool =", chosen_ids)
+    except Exception:
+        pass
 
     print("\n================ REAL WORKLOAD RUN ================")
     print("full_eval:", full_eval)
     print("timing_mode:", getattr(sched.executor.cfg, "timing_mode", None))
     print("aer_repeats:", os.getenv("QDC_AER_TIMING_REPEATS", "1"))
     print("jobs:", len(wl))
+    print("seed:", int(os.getenv("QDC_SEED", "2026")))
     print("congestion_burst_s:", float(os.getenv("QDC_CONGEST_BURST_S", "15.0")))
     print("burst_starts_s:", _parse_float_list("QDC_BURST_STARTS_S", "15,40"))
     print("wide_jobs:", len(wide_ids))
@@ -479,6 +594,9 @@ def run_workload(full_eval: bool = False) -> None:
     print("wide_depths:", _parse_int_list("QDC_WIDE_DEPTHS", "16,24,32"))
     print("wide_shots:", _parse_int_list("QDC_WIDE_SHOTS", "500,1000,2000"))
     print("wide_align_to_bursts:", os.getenv("QDC_WIDE_ALIGN_TO_BURSTS", "1") == "1")
+    # print("step_dt_started_s:", step_dt_started_s)
+    # print("step_dt_idle_min_s:", step_dt_idle_min_s)
+    # print("step_dt_no_future_s:", step_dt_no_future_s)
 
     toggles = RunToggles(
         compute_estimated_fidelity=False,
@@ -492,6 +610,12 @@ def run_workload(full_eval: bool = False) -> None:
     max_steps = int(os.getenv("QDC_MAX_STEPS", "50000"))
     stop_reason = None
     max_to_schedule = int(os.getenv("QDC_MAX_TO_SCHEDULE", "2"))
+
+    # Debug / calibration knobs for scheduler time advancement.
+    # Smaller values reduce coarse-grained queue/start-delay artifacts.
+    step_dt_started_s = float(os.getenv("QDC_STEP_DT_STARTED_S", "0.5"))
+    step_dt_idle_min_s = float(os.getenv("QDC_STEP_DT_IDLE_MIN_S", "0.5"))
+    step_dt_no_future_s = float(os.getenv("QDC_STEP_DT_NO_FUTURE_S", "1.0"))
 
     step_wall_cap_s = float(os.getenv("QDC_STEP_WALL_CAP_S", "15.0"))
     idle_break_steps = int(os.getenv("QDC_IDLE_BREAK_STEPS", "5"))
@@ -516,8 +640,8 @@ def run_workload(full_eval: bool = False) -> None:
             max_to_schedule = max(1, max_to_schedule // 2)
             os.environ["QDC_MAX_TO_SCHEDULE"] = str(max_to_schedule)
             print(f"[WATCHDOG] adapting: setting QDC_MAX_TO_SCHEDULE={max_to_schedule} and continuing.")
-            sched.tick(0.5)
-            now += 0.5
+            sched.tick(step_dt_started_s)
+            now += step_dt_started_s
             continue
 
         if started:
@@ -536,7 +660,15 @@ def run_workload(full_eval: bool = False) -> None:
             stop_reason = f"idle_break_after_completion({idle_break_steps})"
             break
 
-        dt = 0.5 if started else (max(0.5, float(wl[next_idx][0] - now)) if next_idx < len(wl) else 1.0)
+        dt = (
+            step_dt_started_s
+            if started
+            else (
+                max(step_dt_idle_min_s, float(wl[next_idx][0] - now))
+                if next_idx < len(wl)
+                else step_dt_no_future_s
+            )
+        )
         sched.tick(dt)
         now += dt
 

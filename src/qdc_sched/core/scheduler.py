@@ -219,6 +219,114 @@ class Scheduler:
             print(f"[PENDING-WAIT] t={self.now_s:.3f} job={job_id} attempt={attempt} trace_error={e!r}")
 
 
+
+    def _maybe_debug_plan_vs_realized(self, job, plan, rec) -> None:
+        try:
+            debug = os.getenv("QDC_DEBUG_PLAN_VS_REALIZED", "0") == "1"
+            if not debug:
+                return
+            if plan is None or rec is None:
+                return
+            if getattr(plan, "kind", None) != "C_CUT_MULTI_QPU":
+                return
+
+            det = getattr(plan, "details", None) or {}
+            plan_scores = det.get("plan_scores", {}) if isinstance(det, dict) else {}
+
+            best_b_key = None
+            best_b_score = None
+            best_b_pred_total = None
+
+            if isinstance(plan_scores, dict):
+                for k, v in plan_scores.items():
+                    if not str(k).startswith("B_CUT_SINGLE_SEQ"):
+                        continue
+                    if not isinstance(v, dict):
+                        continue
+                    s = v.get("score", None)
+                    pt = v.get("pred_total_s", None)
+                    if s is None:
+                        continue
+                    if best_b_score is None or float(s) < float(best_b_score):
+                        best_b_key = k
+                        best_b_score = float(s)
+                        best_b_pred_total = float(pt) if pt is not None else None
+
+            realized_det = getattr(rec, "details", None) or {}
+            # Derive task-span diagnostics if tasks were recorded
+            tasks = realized_det.get("tasks", []) if isinstance(realized_det, dict) else []
+            first_task_start_s = None
+            last_task_end_s = None
+            first_quantum_start_s = None
+            try:
+                if isinstance(tasks, list) and tasks:
+                    starts = []
+                    ends = []
+                    qstarts = []
+                    for t in tasks:
+                        ts = getattr(t, "start_s", None)
+                        te = getattr(t, "end_s", None)
+                        tk = getattr(t, "kind", None)
+                        if ts is not None:
+                            starts.append(float(ts))
+                            if tk == "quantum":
+                                qstarts.append(float(ts))
+                        if te is not None:
+                            ends.append(float(te))
+                    if starts:
+                        first_task_start_s = min(starts)
+                    if ends:
+                        last_task_end_s = max(ends)
+                    if qstarts:
+                        first_quantum_start_s = min(qstarts)
+            except Exception:
+                pass
+
+            wait_to_first_task = None
+            wait_to_first_quantum = None
+            try:
+                sub_t = float(getattr(job, "submit_time_s", 0.0) or 0.0)
+                if first_task_start_s is not None:
+                    wait_to_first_task = float(first_task_start_s) - sub_t
+                if first_quantum_start_s is not None:
+                    wait_to_first_quantum = float(first_quantum_start_s) - sub_t
+            except Exception:
+                pass
+
+            print(
+                "[PLAN-VS-REALIZED] "
+                f"job={getattr(job, 'job_id', None)} "
+                f"submit_time={getattr(job, 'submit_time_s', None)} "
+                f"chosen={getattr(plan, 'kind', None)} "
+                f"chosen_score={getattr(plan, 'score', None)} "
+                f"chosen_pred_total={getattr(plan, 'predicted_total_time_s', None)} "
+                f"best_b_key={best_b_key} "
+                f"best_b_score={best_b_score} "
+                f"best_b_pred_total={best_b_pred_total} "
+                f"realized_e2e={getattr(rec, 'end_to_end_s', None)} "
+                f"realized_exec={getattr(rec, 't_execution_s', None)} "
+                f"realized_recon={getattr(rec, 't_reconstruction_s', None)} "
+                f"queue_wait={realized_det.get('queue_wait_s', None)} "
+                f"sim_queue_wait={realized_det.get('sim_queue_wait_s', None)} "
+                f"sim_latency={realized_det.get('sim_latency_s', None)} "
+                f"sim_result_ready={realized_det.get('sim_result_ready_time_s', None)} "
+                f"sim_first_task_start={realized_det.get('sim_first_task_start_s', None)} "
+                f"sim_first_quantum_start={realized_det.get('sim_first_quantum_start_s', None)} "
+                f"first_task_start={first_task_start_s} "
+                f"first_quantum_start={first_quantum_start_s} "
+                f"last_task_end={last_task_end_s} "
+                f"wait_to_first_task={wait_to_first_task} "
+                f"wait_to_first_quantum={wait_to_first_quantum} "
+                f"sim_comm={realized_det.get('sim_comm_s', None)} "
+                f"sim_comm_queue={realized_det.get('sim_comm_queue_s', None)} "
+                f"sim_comm_service={realized_det.get('sim_comm_service_s', None)} "
+                f"sim_recon={realized_det.get('sim_recon_s', None)} "
+                f"sim_recon_queue={realized_det.get('sim_recon_queue_s', None)} "
+                f"sim_recon_service={realized_det.get('sim_recon_service_s', None)}"
+            )
+        except Exception as e:
+            print(f"[PLAN-VS-REALIZED] debug_error={e!r}")
+
     def tick(self, dt_s: float) -> None:
         """Advance simulated time, release completed qubits, then retry pending jobs."""
         self.now_s += float(dt_s)
@@ -254,6 +362,7 @@ class Scheduler:
         if plan.kind != "D_WAIT":
             out, rec = self.executor.run_job_plan(job, plan, self.now_s, toggles)
             rec.t_schedule_s = (t_sched1 - t_sched0)
+            self._maybe_debug_plan_vs_realized(job, plan, rec)
 
             try:
                 if rec.details is None or not isinstance(rec.details, dict):
