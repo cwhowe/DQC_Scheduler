@@ -557,7 +557,16 @@ def run_workload(full_eval: bool = False) -> None:
         aer_timing_include_transpile=(os.getenv("QDC_AER_TIMING_INCLUDE_TRANSPILE", "0") == "1"),
     )
 
-    sched = Scheduler(qpus=qpus, quality=QualityModel(noise_models={}), cfg=cfg)
+    sched = Scheduler(
+        qpus=qpus,
+        quality=QualityModel(
+            noise_models={},
+            # Pass per-QPU HardwareProfiles so the fidelity proxy uses real
+            # per-device error rates rather than global fallback constants.
+            qpu_profiles={qid: st.profile for qid, st in qpus.items()},
+        ),
+        cfg=cfg,
+    )
 
     wl, wide_ids = make_workload()
     plan_ctr = _install_plan_debug(sched, wide_ids)
