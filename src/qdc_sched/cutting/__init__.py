@@ -7,6 +7,10 @@ from .assignment import (
     FitCutGreedyAssignment,
     MinMakespanGreedyAssignment,
 )
+from .fitcut import FitCutCutStrategy, FitCutSearchConfig
+from .pandora_bridge import PandoraBridge
+from .pandora_optimizer import PandoraOptimizedCutStrategy
+from .pandora_widgetizer import PandoraWidgetizerStrategy
 
 __all__ = [
     "CutStrategy",
@@ -18,6 +22,10 @@ __all__ = [
     "RoundRobinAssignment",
     "FitCutGreedyAssignment",
     "MinMakespanGreedyAssignment",
+    "FitCutCutStrategy",
+    "FitCutSearchConfig",
+    "PandoraBridge",
+    "PandoraOptimizedCutStrategy",
+    "PandoraWidgetizerStrategy",
 ]
-from .fitcut import FitCutCutStrategy, FitCutSearchConfig
 

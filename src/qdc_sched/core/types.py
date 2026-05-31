@@ -69,6 +69,11 @@ class RunToggles:
     compute_estimated_fidelity: bool = False
     compute_expectation: bool = False
     simulate_only: bool = False
+    use_pandora_optimization: bool = False
+    use_pandora_widgetization: bool = False
+    pandora_config_path: Optional[str] = None
+    pandora_nproc: int = 1
+    pandora_timeout_s: float = 30.0
 
 
 # -------------------------
