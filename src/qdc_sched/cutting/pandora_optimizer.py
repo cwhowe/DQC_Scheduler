@@ -25,10 +25,19 @@ class PandoraOptimizedCutStrategy(CutStrategy):
     ):
         self.bridge = bridge
         self.fallback = fallback if fallback is not None else FitCutCutStrategy()
+        # Each entry: (gates_before, gates_after, depth_before, depth_after)
+        self.gate_count_log: list = []
 
     def _optimized(self, circuit: QuantumCircuit) -> QuantumCircuit:
+        gates_before = circuit.size()
+        depth_before = circuit.depth()
         opt = self.bridge.optimize(circuit)
-        return opt if opt is not None else circuit
+        result = opt if opt is not None else circuit
+        self.gate_count_log.append((
+            gates_before, result.size(),
+            depth_before, result.depth(),
+        ))
+        return result
 
     def analyze(
         self,

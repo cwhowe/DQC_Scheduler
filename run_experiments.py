@@ -225,12 +225,22 @@ def build_scheduler(
     *,
     allow_cutting: bool = True,
     allow_multi_qpu: bool = True,
-    cut_strategy: str = "fitcut",   # "fitcut" | "qiskit_addon" | "none"
+    cut_strategy: str = "fitcut",   # "fitcut" | "qiskit_addon" | "pandora_optimized" | "pandora_widgetizer" | "none"
     max_cuts: int = 3,
     timing_mode: str = "analytic",
 ) -> Scheduler:
     if cut_strategy == "qiskit_addon":
         strategy = QiskitAddonCutStrategy()
+    elif cut_strategy == "pandora_optimized":
+        from qdc_sched.cutting.pandora_bridge import PandoraBridge
+        from qdc_sched.cutting.pandora_optimizer import PandoraOptimizedCutStrategy
+        bridge = PandoraBridge(config_path=os.environ.get("PANDORA_CONFIG_PATH", ""))
+        strategy = PandoraOptimizedCutStrategy(bridge=bridge)
+    elif cut_strategy == "pandora_widgetizer":
+        from qdc_sched.cutting.pandora_bridge import PandoraBridge
+        from qdc_sched.cutting.pandora_widgetizer import PandoraWidgetizerStrategy
+        bridge = PandoraBridge(config_path=os.environ.get("PANDORA_CONFIG_PATH", ""))
+        strategy = PandoraWidgetizerStrategy(bridge=bridge)
     elif cut_strategy == "none" or not allow_cutting:
         strategy = FitCutCutStrategy()   # won't be called when allow_cutting=False
     else:
@@ -657,15 +667,86 @@ def cutting_stress_workload(
     return wl
 
 
+def pandora_stress_workload(n_jobs: int, seed: int = 42) -> List[Tuple[float, Job]]:
+    """T-gate-heavy circuits with explicit adjacent cancellable pairs.
+
+    Each circuit is built in the fault-tolerant {H, T, Tdg, S, Sdg, CX} basis
+    and contains two layers:
+      1. A base random T-gate circuit (depth 15-25).
+      2. A cancellation layer of n_pairs adjacent inverse pairs: T/Tdg, H/H,
+         CX/CX, S/Sdg appended immediately after one another on the same qubit
+         so Pandora's SQL rewrite rules can cancel them.
+
+    Circuits are 9-14 qubits (wider than the 7-qubit QPU pool) to force cutting.
+    """
+    rng = random.Random(seed)
+    wl = []
+    t = 0.0
+    for i in range(n_jobs):
+        t += rng.expovariate(1.0)
+        n = rng.choice([9, 10, 11, 12, 13, 14])
+        shots = rng.choice([500, 1000])
+        qc = QuantumCircuit(n)
+
+        # Base layer: random fault-tolerant basis circuit
+        for _ in range(rng.randint(15, 25)):
+            q = rng.randint(0, n - 1)
+            r = rng.random()
+            if r < 0.30:
+                qc.t(q)
+            elif r < 0.55:
+                qc.tdg(q)
+            elif r < 0.68:
+                qc.h(q)
+            elif r < 0.80:
+                qc.cx(q, (q + 1) % n)
+            elif r < 0.90:
+                qc.s(q)
+            else:
+                qc.sdg(q)
+
+        # Cancellation layer: adjacent inverse pairs that Pandora should cancel
+        for _ in range(rng.randint(10, 18)):
+            q = rng.randint(0, n - 1)
+            r = rng.random()
+            if r < 0.40:
+                qc.t(q);   qc.tdg(q)            # T / Tdg  → cancel
+            elif r < 0.62:
+                qc.h(q);   qc.h(q)              # H / H    → cancel
+            elif r < 0.78:
+                qc.cx(q, (q + 1) % n); qc.cx(q, (q + 1) % n)  # CX / CX → cancel
+            else:
+                qc.s(q);   qc.sdg(q)            # S / Sdg  → cancel
+
+        job = Job(
+            job_id=f"PS{i:04d}",
+            circuit=qc,
+            task_type="expectation",
+            observables=z_obs(n),
+            shots=shots,
+            submit_time_s=t,
+            constraints=JobConstraints(
+                allow_cutting=True,
+                allow_multi_qpu=True,
+                force_cutting=True,
+                max_cuts=2,
+            ),
+        )
+        wl.append((t, job))
+    return wl
+
+
 def exp_e3_algorithm_comparison(args, path: str) -> None:
     print("\n=== E3: Cutting algorithm comparison ===")
     print("  Workload: all circuits width 9-14 (wider than 7-qubit QPUs), force_cutting=True")
     print("  max_cuts=2 so sampling_overhead stays at 4^2=16 max")
 
     conditions = [
-        ("our_fitcut",      "fitcut",       True,  True),
-        ("qiskit_addon",    "qiskit_addon", True,  True),
-        ("no_cut_baseline", "none",         False, False),
+        ("our_fitcut",         "fitcut",              True,  True),
+        ("qiskit_addon",       "qiskit_addon",        True,  True),
+        ("pandora_optimized",  "pandora_optimized",   True,  True),
+        ("pandora_widgetizer", "pandora_widgetizer",  True,  True),
+        ("no_cut_baseline",    "none",                False, False),
     ]
 
     first = True
@@ -690,6 +771,89 @@ def exp_e3_algorithm_comparison(args, path: str) -> None:
         append_rows(path, rows, write_header=first)
         first = False
         print(f"    → {len(records)} jobs completed")
+
+
+# ---------------------------------------------------------------------------
+# Experiment E3P: Pandora stress — cancellable-pair workload
+# ---------------------------------------------------------------------------
+
+def exp_e3p_pandora_stress(args, path: str) -> None:
+    """E3P: Compare cutting strategies on circuits designed for Pandora optimization.
+
+    Uses pandora_stress_workload() which generates T-gate-heavy circuits with
+    explicit adjacent inverse pairs (T/Tdg, H/H, CX/CX, S/Sdg) that Pandora's
+    SQL rewrite rules can cancel. The base circuit layer provides realistic
+    non-trivial structure; the cancellation layer gives Pandora work to do.
+
+    Also writes e3p_gate_counts.csv with per-circuit gate/depth before vs after
+    Pandora optimization, so the raw optimization effect is separately visible.
+    """
+    print("\n=== E3P: Pandora stress workload (cancellable-pair circuits) ===")
+    print("  Workload: T-gate-heavy circuits with adjacent T/Tdg, H/H, CX/CX pairs")
+    print("  Pandora should cancel these pairs before FitCut sees the circuit")
+
+    gate_counts_path = os.path.join(os.path.dirname(path), "e3p_gate_counts.csv")
+
+    conditions = [
+        ("fitcut_baseline",    "fitcut",              True, True),
+        ("pandora_optimized",  "pandora_optimized",   True, True),
+        ("pandora_widgetizer", "pandora_widgetizer",  True, True),
+    ]
+
+    first = True
+    for cname, strategy_name, allow_cut, allow_multi in conditions:
+        print(f"  Running condition: {cname}")
+        qpus = default_qpu_pool(n_qpus=2, n_qubits=7)
+
+        # Build strategy explicitly for pandora_optimized so we can read gate stats
+        pandora_strategy_obj = None
+        if strategy_name == "pandora_optimized":
+            from qdc_sched.cutting.pandora_bridge import PandoraBridge
+            from qdc_sched.cutting.pandora_optimizer import PandoraOptimizedCutStrategy
+            bridge = PandoraBridge(config_path=os.environ.get("PANDORA_CONFIG_PATH", ""))
+            pandora_strategy_obj = PandoraOptimizedCutStrategy(bridge=bridge)
+            sched = build_scheduler(qpus, allow_cutting=allow_cut,
+                                    allow_multi_qpu=allow_multi, cut_strategy="fitcut", max_cuts=2)
+            sched.cfg.planner.cut_strategy = pandora_strategy_obj
+        else:
+            sched = build_scheduler(qpus, allow_cutting=allow_cut,
+                                    allow_multi_qpu=allow_multi,
+                                    cut_strategy=strategy_name, max_cuts=2)
+
+        wl = pandora_stress_workload(args.n_jobs, seed=args.seed)
+        toggles = RunToggles(simulate_only=False)
+        records = run_tick_loop(sched, wl, toggles)
+        rows = [record_to_row(r, "E3P_pandora_stress", cname) for r in records]
+        append_rows(path, rows, write_header=first)
+        first = False
+        print(f"    → {len(records)} jobs completed")
+
+        # Write gate count stats for pandora_optimized
+        if pandora_strategy_obj is not None and pandora_strategy_obj.gate_count_log:
+            log = pandora_strategy_obj.gate_count_log
+            gc_rows = [
+                {
+                    "circuit_idx": i,
+                    "gates_before": b,
+                    "gates_after": a,
+                    "gates_cancelled": b - a,
+                    "pct_reduction": round(100 * (b - a) / b, 2) if b else 0,
+                    "depth_before": db,
+                    "depth_after": da,
+                    "depth_reduction": db - da,
+                }
+                for i, (b, a, db, da) in enumerate(log)
+            ]
+            gc_first = not os.path.exists(gate_counts_path)
+            append_rows(gate_counts_path, gc_rows, write_header=gc_first)
+            avg_gates = sum(b for b, a, *_ in log) / len(log)
+            avg_after = sum(a for b, a, *_ in log) / len(log)
+            avg_db = sum(db for *_, db, da in log) / len(log)
+            avg_da = sum(da for *_, db, da in log) / len(log)
+            print(f"    gate reduction: {avg_gates:.1f} → {avg_after:.1f} "
+                  f"({100*(avg_gates-avg_after)/avg_gates:.1f}%)")
+            print(f"    depth reduction: {avg_db:.1f} → {avg_da:.1f} "
+                  f"({100*(avg_db-avg_da)/avg_db:.1f}%)")
 
 
 # ---------------------------------------------------------------------------
@@ -1712,6 +1876,7 @@ def run_selected_experiments(args, outdir: str) -> None:
         "E1": (exp_e1_plan_comparison,    "e1_plan_comparison.csv"),
         "E2": (exp_e2_workload_variation, "e2_workload_variation.csv"),
         "E3": (exp_e3_algorithm_comparison, "e3_algorithm_comparison.csv"),
+        "E3P": (exp_e3p_pandora_stress,    "e3p_pandora_stress.csv"),
         "E4": (exp_e4_qpu_diversity,      "e4_qpu_diversity.csv"),
         "E5": (exp_e5_batch_vs_stream,    "e5_batch_vs_stream.csv"),
         "E6": (exp_e6_width_sweep,        "e6_width_sweep.csv"),
@@ -1731,7 +1896,7 @@ def run_selected_experiments(args, outdir: str) -> None:
     print(f"[EXPERIMENTS] running: {sorted(wanted)}")
     t0 = time.time()
 
-    for key in ["E1","E2","E3","E4","E5","E6","E7","E8","E9","E10","E11","E12","E13","E14","E15","E16"]:
+    for key in ["E1","E2","E3","E3P","E4","E5","E6","E7","E8","E9","E10","E11","E12","E13","E14","E15","E16"]:
         if key not in wanted:
             continue
         fn, fname = dispatch[key]
