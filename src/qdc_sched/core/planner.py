@@ -1,4 +1,5 @@
 from __future__ import annotations
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Set
 import math
@@ -748,6 +749,33 @@ class Planner:
         except Exception:
             pass
         return Plan(kind="D_WAIT", predicted_total_time_s=float("inf"), score=float("inf"), details=wait_details)
+
+def make_planner_config(toggles: RunToggles, base_cfg: Optional[PlannerConfig] = None) -> PlannerConfig:
+    """Build a PlannerConfig from RunToggles, wiring in Pandora strategies when requested.
+
+    Priority: widgetization > optimization. Both require pandora_config_path to be set.
+    Falls back to the base_cfg cut_strategy (FitCutCutStrategy by default) if Pandora
+    is not requested or the config path is absent.
+    """
+    cfg = base_cfg if base_cfg is not None else PlannerConfig()
+    config_path = getattr(toggles, "pandora_config_path", None)
+    nproc = int(getattr(toggles, "pandora_nproc", 1))
+    timeout_s = float(getattr(toggles, "pandora_timeout_s", 30.0))
+
+    if getattr(toggles, "use_pandora_widgetization", False) and config_path:
+        from ..cutting.pandora_bridge import PandoraBridge
+        from ..cutting.pandora_widgetizer import PandoraWidgetizerStrategy
+        bridge = PandoraBridge(config_path=config_path, nproc=nproc, timeout_s=timeout_s)
+        return dataclasses.replace(cfg, cut_strategy=PandoraWidgetizerStrategy(bridge=bridge))
+
+    if getattr(toggles, "use_pandora_optimization", False) and config_path:
+        from ..cutting.pandora_bridge import PandoraBridge
+        from ..cutting.pandora_optimizer import PandoraOptimizedCutStrategy
+        bridge = PandoraBridge(config_path=config_path, nproc=nproc, timeout_s=timeout_s)
+        return dataclasses.replace(cfg, cut_strategy=PandoraOptimizedCutStrategy(bridge=bridge))
+
+    return cfg
+
 
 def transpile_restricted(qc: QuantumCircuit, qpu: QPUState, physical_qubits: List[int], opt_level: int = 1) -> QuantumCircuit:
     """Transpile using a default/common basis so unsupported gates (like those in QFT) are decomposed.
