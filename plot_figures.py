@@ -368,6 +368,181 @@ def fig08(e3,od):
     
     fig.tight_layout(); _save(fig,f"{od}/fig08_algorithm_table")
 
+# ── Fig 8p: Pandora strategy comparison (E3 with pandora conditions) ──────────
+def fig08p(e3, od):
+    """Three-panel comparison: latency, fidelity, plan mix across all E3 conditions."""
+    conds = ["our_fitcut", "qiskit_addon", "pandora_optimized", "pandora_widgetizer"]
+    labels = ["FitCut\n(baseline)", "Qiskit\nAddon", "Pandora +\nFitCut", "Pandora\nWidgetizer"]
+    colors = [TEAL, AMBER, BLUE, CORAL]
+    present = set(r.get("condition") for r in e3)
+    conds  = [c for c in conds  if c in present]
+    labels = [labels[i] for i, c in enumerate(
+        ["our_fitcut","qiskit_addon","pandora_optimized","pandora_widgetizer"]) if c in present]
+    colors = colors[:len(conds)]
+    x = np.arange(len(conds))
+    w = 0.55
+
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(11, 3.6))
+
+    # Panel 1: median end-to-end latency
+    e2e = [statistics.median(vp(e3, "end_to_end_s", c) or [0]) for c in conds]
+    bars = ax1.bar(x, e2e, width=w, color=colors, edgecolor="white", linewidth=0.4)
+    for xi, v in zip(x, e2e):
+        ax1.text(xi, v + max(e2e)*0.01, f"{v:.2f}s", ha="center", va="bottom", fontsize=9)
+    ax1.set_xticks(x); ax1.set_xticklabels(labels, fontsize=9)
+    ax1.set_ylabel("Median end-to-end (s)")
+    ax1.set_title("Latency")
+    ymax = max(e2e) * 1.18 if e2e else 1
+    ax1.set_ylim(0, ymax)
+
+    # Panel 2: median fidelity proxy
+    fid = [statistics.median(vp(e3, "fidelity_proxy", c) or [0]) for c in conds]
+    ax2.bar(x, fid, width=w, color=colors, edgecolor="white", linewidth=0.4)
+    for xi, v in zip(x, fid):
+        ax2.text(xi, v + 0.002, f"{v:.3f}", ha="center", va="bottom", fontsize=9)
+    ax2.set_xticks(x); ax2.set_xticklabels(labels, fontsize=9)
+    ax2.set_ylabel("Median fidelity proxy")
+    ax2.set_title("Fidelity")
+    fmin = min(fid) if fid else 0
+    ax2.set_ylim(max(0, fmin - 0.05), min(1.0, max(fid) * 1.06) if fid else 1)
+
+    # Panel 3: plan mix (stacked bars — A/B/C)
+    plan_types = [("A_NO_CUT_SINGLE", TEAL, "Plan A"), ("B_CUT_SINGLE_SEQ", AMBER, "Plan B"),
+                  ("C_CUT_MULTI_QPU", BLUE, "Plan C")]
+    bot = np.zeros(len(conds))
+    for plan_kind, col, lbl in plan_types:
+        pcts = []
+        for c in conds:
+            total = sum(1 for r in e3 if r.get("condition") == c)
+            n = sum(1 for r in e3 if r.get("condition") == c and r.get("plan_kind") == plan_kind)
+            pcts.append(100 * n / max(total, 1))
+        ax3.bar(x, pcts, bottom=bot, width=w, color=col, edgecolor="white",
+                linewidth=0.4, label=lbl, alpha=0.88)
+        for xi, v, b in zip(x, pcts, bot):
+            if v > 4:
+                ax3.text(xi, b + v/2, f"{v:.0f}%", ha="center", va="center",
+                         fontsize=8, color="white", fontweight="bold")
+        bot += np.array(pcts)
+    ax3.set_xticks(x); ax3.set_xticklabels(labels, fontsize=9)
+    ax3.set_ylabel("Jobs (%)")
+    ax3.set_title("Plan mix")
+    ax3.set_ylim(0, 115)
+    ax3.legend(loc="upper right", fontsize=7, framealpha=0.7)
+
+    fig.suptitle("Cutting strategy comparison (E3)", fontsize=12, fontweight="bold", y=1.01)
+    fig.tight_layout()
+    _save(fig, f"{od}/fig08p_pandora_comparison")
+
+# ── Fig 8q: Pandora stress workload comparison (E3P) ─────────────────────────
+def fig08q(e3p, e3p_gc, od):
+    """Four-panel Pandora stress comparison.
+
+    Panels: (1) end-to-end latency, (2) fidelity, (3) plan mix,
+    (4) gate/depth reduction from Pandora optimization.
+    Panel 4 uses e3p_gate_counts.csv and shows what Pandora actually achieved
+    regardless of whether it translated into scheduling latency improvement.
+    """
+    conds  = ["fitcut_baseline", "pandora_optimized", "pandora_widgetizer"]
+    labels = ["FitCut\n(baseline)", "Pandora +\nFitCut", "Pandora\nWidgetizer"]
+    colors = [TEAL, BLUE, CORAL]
+    present = set(r.get("condition") for r in e3p)
+    idx    = [i for i, c in enumerate(conds) if c in present]
+    conds  = [conds[i]  for i in idx]
+    labels = [labels[i] for i in idx]
+    colors = [colors[i] for i in idx]
+    x = np.arange(len(conds))
+    w = 0.55
+
+    fig, axes = plt.subplots(1, 4, figsize=(14, 3.6))
+    ax1, ax2, ax3, ax4 = axes
+
+    # Panel 1: median end-to-end latency with % vs baseline
+    e2e = [statistics.median(vp(e3p, "end_to_end_s", c) or [0]) for c in conds]
+    baseline = e2e[0] if e2e else 1.0
+    ax1.bar(x, e2e, width=w, color=colors, edgecolor="white", linewidth=0.4)
+    for xi, v in zip(x, e2e):
+        pct = 100 * (v - baseline) / baseline if baseline else 0
+        sign = "+" if pct >= 0 else ""
+        label = f"{v:.2f}s" if xi == 0 else f"{v:.2f}s\n({sign}{pct:.1f}%)"
+        ax1.text(xi, v + max(e2e) * 0.01, label, ha="center", va="bottom", fontsize=8)
+    ax1.set_xticks(x); ax1.set_xticklabels(labels, fontsize=8.5)
+    ax1.set_ylabel("Median end-to-end (s)")
+    ax1.set_title("Latency")
+    ax1.set_ylim(0, max(e2e) * 1.28 if e2e else 1)
+
+    # Panel 2: median fidelity proxy
+    fid = [statistics.median(vp(e3p, "fidelity_proxy", c) or [0]) for c in conds]
+    ax2.bar(x, fid, width=w, color=colors, edgecolor="white", linewidth=0.4)
+    for xi, v in zip(x, fid):
+        ax2.text(xi, v + 0.002, f"{v:.3f}", ha="center", va="bottom", fontsize=8.5)
+    ax2.set_xticks(x); ax2.set_xticklabels(labels, fontsize=8.5)
+    ax2.set_ylabel("Median fidelity proxy")
+    ax2.set_title("Fidelity")
+    fmin = min(fid) if fid else 0
+    ax2.set_ylim(max(0, fmin - 0.05), min(1.0, max(fid) * 1.06) if fid else 1)
+
+    # Panel 3: plan mix
+    plan_types = [("A_NO_CUT_SINGLE", TEAL, "Plan A"), ("B_CUT_SINGLE_SEQ", AMBER, "Plan B"),
+                  ("C_CUT_MULTI_QPU", BLUE, "Plan C")]
+    bot = np.zeros(len(conds))
+    for plan_kind, col, lbl in plan_types:
+        pcts = []
+        for c in conds:
+            total = sum(1 for r in e3p if r.get("condition") == c)
+            n = sum(1 for r in e3p if r.get("condition") == c and r.get("plan_kind") == plan_kind)
+            pcts.append(100 * n / max(total, 1))
+        ax3.bar(x, pcts, bottom=bot, width=w, color=col, edgecolor="white",
+                linewidth=0.4, label=lbl, alpha=0.88)
+        for xi, v, b in zip(x, pcts, bot):
+            if v > 4:
+                ax3.text(xi, b + v/2, f"{v:.0f}%", ha="center", va="center",
+                         fontsize=8, color="white", fontweight="bold")
+        bot += np.array(pcts)
+    ax3.set_xticks(x); ax3.set_xticklabels(labels, fontsize=8.5)
+    ax3.set_ylabel("Jobs (%)")
+    ax3.set_title("Plan mix")
+    ax3.set_ylim(0, 115)
+    ax3.legend(loc="upper right", fontsize=7, framealpha=0.7)
+
+    # Panel 4: gate count and depth before vs after Pandora (from e3p_gate_counts.csv)
+    if e3p_gc:
+        gb = [sf(r.get("gates_before")) for r in e3p_gc if sf(r.get("gates_before")) is not None]
+        ga = [sf(r.get("gates_after"))  for r in e3p_gc if sf(r.get("gates_after"))  is not None]
+        db = [sf(r.get("depth_before")) for r in e3p_gc if sf(r.get("depth_before")) is not None]
+        da = [sf(r.get("depth_after"))  for r in e3p_gc if sf(r.get("depth_after"))  is not None]
+        avg_gb = statistics.mean(gb) if gb else 0
+        avg_ga = statistics.mean(ga) if ga else 0
+        avg_db = statistics.mean(db) if db else 0
+        avg_da = statistics.mean(da) if da else 0
+
+        bx = np.array([0, 1])
+        before_vals = [avg_gb, avg_db]
+        after_vals  = [avg_ga, avg_da]
+        bw = 0.32
+        bars_b = ax4.bar(bx - bw/2, before_vals, width=bw, color=GRAY,  label="Before", alpha=0.85, edgecolor="white")
+        bars_a = ax4.bar(bx + bw/2, after_vals,  width=bw, color=PURPLE, label="After",  alpha=0.85, edgecolor="white")
+        for bar, v in zip(bars_b, before_vals):
+            ax4.text(bar.get_x() + bar.get_width()/2, v + 0.3, f"{v:.1f}", ha="center", va="bottom", fontsize=8)
+        for bar, v, bv in zip(bars_a, after_vals, before_vals):
+            pct = 100 * (bv - v) / bv if bv else 0
+            ax4.text(bar.get_x() + bar.get_width()/2, v + 0.3, f"{v:.1f}\n(−{pct:.0f}%)",
+                     ha="center", va="bottom", fontsize=7.5, color=PURPLE)
+        ax4.set_xticks(bx)
+        ax4.set_xticklabels(["Gate count", "Depth"], fontsize=9)
+        ax4.set_ylabel("Count")
+        ax4.set_title("Pandora optimization\n(gates & depth reduced)")
+        ax4.legend(fontsize=8, framealpha=0.7)
+        ax4.set_ylim(0, max(before_vals) * 1.3)
+    else:
+        ax4.text(0.5, 0.5, "No gate count data\n(run E3P to generate)", ha="center",
+                 va="center", transform=ax4.transAxes, fontsize=9, color=GRAY)
+        ax4.set_title("Pandora optimization")
+
+    fig.suptitle("Pandora stress workload: cancellable-pair circuits (E3P)",
+                 fontsize=12, fontweight="bold", y=1.01)
+    fig.tight_layout()
+    _save(fig, f"{od}/fig08q_pandora_stress")
+
 # ── Fig 9: QPU load + Gini (E4) ─────────────────────────────────────────────
 def fig09(e4, od):
     """E4: Fidelity gain and plan mix across QPU pool configurations."""
@@ -3014,6 +3189,8 @@ _FIGURE_REGISTRY = {
     "6":   (fig06,                     ["e2"]),
     "7":   (fig07,                     ["e1"]),
     "8":   (fig08,                     ["e3"]),
+    "8p":  (fig08p,                    ["e3"]),
+    "8q":  (fig08q,                    ["e3p", "e3p_gc"]),
     "9":   (fig09,                     ["e4"]),
     "10":  (fig10,                     ["e4"]),
     "11":  (fig11,                     ["e5"]),
@@ -3123,6 +3300,8 @@ def main():
     e1  = _try_load_csv(indir,  "e1_plan_comparison.csv")
     e2  = _try_load_csv(indir,  "e2_workload_variation.csv")
     e3  = _try_load_csv(indir,  "e3_algorithm_comparison.csv")
+    e3p     = _try_load_csv(indir,  "e3p_pandora_stress.csv")
+    e3p_gc  = _try_load_csv(indir,  "e3p_gate_counts.csv")
     e4  = _try_load_csv(indir,  "e4_qpu_diversity.csv")
     e5  = _try_load_csv(indir,  "e5_batch_vs_stream.csv")
     e6  = _try_load_csv(indir,  "e6_width_sweep.csv")
@@ -3152,7 +3331,7 @@ def main():
     named = [(n, r) for n, r in [("E1",e1),("E2",e2),("E3",e3),("E4",e4),("E5",e5)] if r]
 
     data = dict(
-        e1=e1, e2=e2, e3=e3, e4=e4, e5=e5, e6=e6, e7=e7, e8=e8,
+        e1=e1, e2=e2, e3=e3, e3p=e3p, e3p_gc=e3p_gc, e4=e4, e5=e5, e6=e6, e7=e7, e8=e8,
         e9=e9, e10=e10, e11=e11, e12=e12, e13=e13, e14=e14, e15=e15, e16=e16,
         e20=e20, e15_json=e15_json, e18_json=e18_json,
         e21_json=e21_json, e24_json=e24_json, named=named,
