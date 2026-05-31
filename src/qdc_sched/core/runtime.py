@@ -9,45 +9,41 @@ from .hardware import HardwareProfile
 
 
 def predict_exec_time_s(qpu: HardwareProfile, prof: CircuitProfile, *, shots: int) -> float:
-    """Depth-aware analytic execution-time estimate in seconds.
+    """Gate-composition analytic execution-time estimate in seconds.
 
-    Uses circuit depth as a proxy for the critical-path gate time, which accounts
-    for parallel gate layers on real hardware. This is more accurate than a naive
-    gate-count sum, which would overestimate by up to ~10x on wide parallel circuits.
+    Models execution cost as a weighted sum of gate counts rather than circuit depth.
+    This makes gate-count reductions (e.g. from Pandora cancellation) directly visible
+    in predicted latency, and allows T-gate overhead modelling for fault-tolerant regimes.
 
     Model (per shot):
-        t_gate  = depth * t_layer
-        t_layer = max(t_2q, t_1q)  -- dominated by the slowest gate in any layer
-        t_meas  = n_measured_qubits * t_meas   (readout is parallel per qubit)
-        t_reset = n_qubits * t_reset           (active reset, if used)
-        t_shot  = t_gate + t_meas + shot_overhead_s
+        n_t      = T/Tdg gate count (subset of 1Q gates)
+        n_cliff  = non-T 1Q gate count  (n1 - n_t)
+        t_gate   = n_t * t1 * t_gate_overhead + n_cliff * t1 + n2 * t2
+        t_meas   = 1 readout cycle (parallel across all measured qubits)
+        t_shot   = t_gate + t_meas + shot_overhead_s
 
-    Constants are calibrated to IBM Falcon/Eagle/Heron ranges (2023-2025):
+    t_gate_overhead defaults to 1.0 (physical qubit regime, T costs same as SX/RZ).
+    Set to ~50.0 via HardwareProfile.t_gate_overhead or env QDC_T_GATE_OVERHEAD to
+    model fault-tolerant magic-state distillation cost for T gates.
+
+    Constants calibrated to IBM Falcon/Eagle/Heron (2023-2025):
         1Q gate (SX/RZ):  ~30-50 ns  → default 35 ns
-        2Q gate (CX/ECR): ~200-500 ns → default 300 ns  (layer-dominating)
+        2Q gate (CX/ECR): ~200-500 ns → default 300 ns
         Readout:          ~500-1500 ns → default 1000 ns
         Shot overhead:    ~50-500 µs  → default 250 µs
-            (classical control reset, state prep, data movement; see
-             Bravyi et al. 2022, IBM Quantum system specs, and
-             Krantz et al. Rev. Mod. Phys. 91, 025005 (2019) §V)
 
     References:
         Krantz et al., Rev. Mod. Phys. 91, 025005 (2019)
-        Arute et al., Nature 574, 505–510 (2019) — gate time benchmarks
         IBM Quantum backend calibration data (ibm_kyiv, ibm_brisbane, 2024)
     """
-    depth = int(getattr(prof, "depth", 0) or 0)
     n2 = int(getattr(prof, "twoq_count", 0) or 0)
     n1 = int(getattr(prof, "oneq_count", 0) or 0)
-    m = int(getattr(prof, "meas_count", 0) or 0)
-    width = int(getattr(prof, "width", 1) or 1)
+    nt = int(getattr(prof, "t_count", 0) or 0)
+    depth = int(getattr(prof, "depth", 0) or 0)
 
     t1 = float(getattr(qpu, "oneq_gate_time_s", 35e-9) or 35e-9)
     t2 = float(getattr(qpu, "twoq_gate_time_s", 300e-9) or 300e-9)
     tm = float(getattr(qpu, "meas_time_s", 1_000e-9) or 1_000e-9)
-    # shot_overhead_s covers classical control reset + state prep + data readout latency.
-    # Default 250 µs is conservative mid-range for IBM superconducting devices.
-    # Override via HardwareProfile.shot_overhead_s or env QDC_SHOT_OVERHEAD_S.
     shot_ov = float(getattr(qpu, "shot_overhead_s", 0.0) or 0.0)
     env_ov = os.getenv("QDC_SHOT_OVERHEAD_S")
     if env_ov is not None:
@@ -56,24 +52,24 @@ def predict_exec_time_s(qpu: HardwareProfile, prof: CircuitProfile, *, shots: in
         except ValueError:
             pass
 
-    # Per-layer time: dominated by the slowest gate present in a typical layer.
-    # Use t_2q as the layer time when 2Q gates exist (they dominate), else t_1q.
-    if n2 > 0:
-        t_layer = t2
-    else:
-        t_layer = t1
+    # T-gate overhead multiplier: env takes precedence over profile field.
+    t_overhead = float(getattr(qpu, "t_gate_overhead", 1.0) or 1.0)
+    env_tov = os.getenv("QDC_T_GATE_OVERHEAD")
+    if env_tov is not None:
+        try:
+            t_overhead = float(env_tov)
+        except ValueError:
+            pass
 
-    if depth > 0:
-        # Critical-path model: depth layers, each taking t_layer.
+    if n1 + n2 > 0:
+        n_cliff = max(0, n1 - nt)
+        t_gate = nt * t1 * t_overhead + n_cliff * t1 + n2 * t2
+    else:
+        # Empty / barrier-only: fall back to depth-based estimate.
+        t_layer = t2 if n2 > 0 else t1
         t_gate = depth * t_layer
-    else:
-        # Fallback for depth=0 (e.g., empty or barrier-only circuits).
-        t_gate = n1 * t1 + n2 * t2
 
-    # Readout: parallel per qubit, so total readout ≈ 1 * t_meas (not n_qubits * t_meas).
-    # Use max(m, 1) to handle un-measured circuits gracefully.
     t_meas = tm  # one readout cycle (parallel across all measured qubits)
-
     t_shot = t_gate + t_meas + shot_ov
     return float(shots) * t_shot
 

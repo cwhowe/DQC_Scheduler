@@ -61,6 +61,13 @@ class HardwareProfile:
     # Override per-QPU or via env QDC_SHOT_OVERHEAD_S.
     shot_overhead_s: float = 250e-6
 
+    # T-gate time multiplier relative to other 1Q gates.
+    # Default 1.0 = T costs the same as SX/RZ (physical qubit regime).
+    # Set to ~50.0 to model fault-tolerant magic-state distillation overhead,
+    # where T gates dominate circuit cost vs Clifford gates.
+    # Override via env QDC_T_GATE_OVERHEAD or per-QPU in RunToggles.
+    t_gate_overhead: float = 1.0
+
     # Scalar fallback error rates (used for quality proxy when per-qubit maps absent)
     oneq_error: float = 1e-3
     twoq_error: float = 2e-2

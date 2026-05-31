@@ -237,20 +237,112 @@ def _coupling_graph_from_backend(b) -> nx.Graph:
     return G
 
 
+_TARGET_1Q_GATES = frozenset({"rz", "sx", "x", "u", "u1", "u2", "u3"})
+_TARGET_2Q_GATES = frozenset({"cx", "ecr", "cz"})
+
+
+def _avg_gate_metrics_from_target(b) -> Tuple[float, float, float, float, float, float]:
+    """Extract timing/error metrics from backend.target (BackendV2 API).
+
+    Returns (oneq_err, twoq_err, readout_err, oneq_time_s, twoq_time_s, meas_time_s)
+    or raises ValueError if target is unavailable or has no useful data.
+
+    InstructionProperties.duration is in seconds when .unit == 's', or in dt units
+    when .unit == 'dt'. We read target.dt to convert the latter.
+    """
+    target = getattr(b, "target", None)
+    if target is None:
+        raise ValueError("no target")
+
+    dt = getattr(target, "dt", None)
+    if dt is not None:
+        dt = float(dt)
+
+    e1, t1, e2, t2 = [], [], [], []
+
+    for gate_name in target.operation_names:
+        qargs_map = target[gate_name]
+        if qargs_map is None:
+            continue
+        is_1q = gate_name in _TARGET_1Q_GATES
+        is_2q = gate_name in _TARGET_2Q_GATES
+        if not (is_1q or is_2q):
+            continue
+
+        for qargs, props in qargs_map.items():
+            if props is None:
+                continue
+            err = getattr(props, "error", None)
+            dur = getattr(props, "duration", None)
+            unit = getattr(props, "unit", "dt")
+
+            if err is not None:
+                if is_1q:
+                    e1.append(float(err))
+                else:
+                    e2.append(float(err))
+
+            if dur is not None:
+                # Target.InstructionProperties.duration is always in seconds
+                # regardless of the .unit attribute (which is informational only).
+                dur_s = float(dur)
+                if is_1q:
+                    t1.append(dur_s)
+                else:
+                    t2.append(dur_s)
+
+    if not (e1 or t1 or e2 or t2):
+        raise ValueError("target had no usable timing/error data")
+    # Reject if all durations are zero (uncalibrated fake backend).
+    has_real_timing = any(x > 0 for x in t1) or any(x > 0 for x in t2)
+    if not has_real_timing:
+        raise ValueError("target gate durations are all zero (uncalibrated)")
+
+    oneq_err = float(sum(e1) / len(e1)) if e1 else 1.2e-3
+    twoq_err = float(sum(e2) / len(e2)) if e2 else 2.0e-2
+    oneq_time_s = float(sum(t1) / len(t1)) if t1 else 40e-9
+    twoq_time_s = float(sum(t2) / len(t2)) if t2 else 300e-9
+
+    # Readout error/time from target["measure"] if present
+    readout_err = 2.0e-2
+    meas_time_s = 1_000e-9
+    meas_map = target["measure"] if "measure" in target.operation_names else None
+    if meas_map:
+        ro_errs, ro_durs = [], []
+        for qargs, props in meas_map.items():
+            if props is None:
+                continue
+            err = getattr(props, "error", None)
+            dur = getattr(props, "duration", None)
+            unit = getattr(props, "unit", "dt")
+            if err is not None:
+                ro_errs.append(float(err))
+            if dur is not None:
+                ro_durs.append(float(dur))
+        if ro_errs:
+            readout_err = float(sum(ro_errs) / len(ro_errs))
+        if ro_durs:
+            meas_time_s = float(sum(ro_durs) / len(ro_durs))
+
+    return oneq_err, twoq_err, readout_err, oneq_time_s, twoq_time_s, meas_time_s
+
+
 def _avg_gate_metrics_from_properties(b) -> Tuple[float, float, float, float, float, float]:
     """Return (oneq_err, twoq_err, readout_err, oneq_time_s, twoq_time_s, meas_time_s).
 
-    Extracts calibration data from backend.properties(). Falls back to
-    IBM Falcon/Eagle median values when properties are unavailable.
+    Tries backend.target first (BackendV2 per-qubit data), then falls back to
+    backend.properties() (BackendV1 averaged data), then IBM Falcon/Eagle medians.
 
     IMPORTANT — units: gate_length and readout_length in backend.properties() are
-    stored in dt units (integer counts of the backend's sampling period dt).
-    They must be multiplied by dt (seconds) to get wall-clock seconds.
-    Failing to do this conversion produces values ~1e9x too large.
-    dt is read from backend.configuration().dt (typically ~0.222 ns for IBM backends).
-
-    Readout time is extracted from the 'readout_length' property per qubit.
+    stored in dt units. They must be multiplied by dt (seconds) to get wall-clock
+    seconds. dt is read from backend.configuration().dt (~0.222 ns for IBM backends).
     """
+    # Primary: BackendV2 target (per-qubit, per-gate durations)
+    try:
+        return _avg_gate_metrics_from_target(b)
+    except Exception:
+        pass
+
     oneq_err = 1.2e-3
     twoq_err = 2.0e-2
     readout_err = 2.0e-2
