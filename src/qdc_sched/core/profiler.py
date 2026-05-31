@@ -27,18 +27,23 @@ def _density(g: nx.Graph) -> float:
         return 0.0
     return 2.0 * g.number_of_edges() / (n*(n-1))
 
+_T_GATE_NAMES = frozenset({"t", "tdg", "t_dg"})
+
 def profile_circuit(qc: QuantumCircuit) -> CircuitProfile:
     dag = circuit_to_dag(qc)
     depth = qc.depth() or 0
     oneq = 0
     twoq = 0
     meas = 0
+    t_count = 0
     for node in dag.op_nodes():
         nq = node.op.num_qubits
         if node.op.name == "measure":
             meas += 1
         elif nq == 1:
             oneq += 1
+            if node.op.name in _T_GATE_NAMES:
+                t_count += 1
         elif nq == 2:
             twoq += 1
     ig = _interaction_graph(qc)
@@ -60,6 +65,7 @@ def profile_circuit(qc: QuantumCircuit) -> CircuitProfile:
         "depth": float(depth),
         "twoq": float(twoq),
         "dens": float(dens),
+        "t_count": float(t_count),
     }
     return CircuitProfile(
         width=qc.num_qubits,
@@ -67,6 +73,7 @@ def profile_circuit(qc: QuantumCircuit) -> CircuitProfile:
         twoq_count=twoq,
         oneq_count=oneq,
         meas_count=meas,
+        t_count=t_count,
         interaction_density=dens,
         cut_suitability=suit,
         features=features,

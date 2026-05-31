@@ -45,6 +45,8 @@ class CircuitProfile:
     oneq_count: int
     meas_count: int
     interaction_density: float
+    # T-gate count: used with HardwareProfile.t_gate_overhead for fault-tolerant cost modelling.
+    t_count: int = 0
     # ranked candidates: list of (qpu_id, score, predicted_latency_s, fidelity_proxy)
     ranked_qpus: List[Tuple[str, float, float, float]] = field(default_factory=list)
     # classification: "bad" | "neutral" | "good"

@@ -51,6 +51,90 @@ pip install -e ".[ibm]"
 
 ---
 
+## Pandora Integration (Optional)
+
+[Pandora](https://github.com/ioanamoflic/pandora) is an optional quantum circuit
+optimizer that uses a PostgreSQL backend to apply gate-cancellation rewrite rules
+via SQL stored procedures. When enabled, the scheduler pre-optimizes circuits
+before cutting, reducing gate count and subcircuit overhead.
+
+### Prerequisites
+
+- PostgreSQL running locally (or accessible remotely)
+- A `pandora` database created and initialized with Pandora's schema
+
+### Setup
+
+**1. Clone the Pandora repository:**
+
+```bash
+git clone https://github.com/ioanamoflic/pandora.git ~/pandora
+```
+
+**2. Set the source path environment variable:**
+
+```bash
+export PANDORA_SRC_PATH=~/pandora/src
+```
+
+Add this to your shell profile (`~/.zshrc` or `~/.bashrc`) to persist across sessions.
+
+**3. Install Pandora's Python dependencies into your venv:**
+
+```bash
+pip install asyncpg psycopg2-binary cirq qualtran==0.6.1
+```
+
+**4. Create and initialize the Pandora database:**
+
+```bash
+createdb pandora
+psql pandora < ~/pandora/src/pandora/db/schema.sql
+```
+
+**5. Create a database config file** (e.g. `pandora_db.json`):
+
+```json
+{
+  "user": "your_pg_user",
+  "password": "your_pg_password",
+  "host": "localhost",
+  "port": 5432,
+  "database": "pandora"
+}
+```
+
+### Activating Pandora optimization
+
+Pass `RunToggles` with Pandora flags set to `make_planner_config()`:
+
+```python
+from qdc_sched.core.types import RunToggles
+from qdc_sched.core.planner import make_planner_config
+
+# Gate-cancellation optimization before cutting
+toggles = RunToggles(
+    use_pandora_optimization=True,
+    pandora_config_path="pandora_db.json",
+    pandora_nproc=4,       # parallel rewrite threads (default: 1)
+    pandora_timeout_s=30.0, # per-pass timeout in seconds (default: 30)
+)
+cfg = make_planner_config(toggles)
+
+# Widget-based partitioning (alternative to FitCut)
+toggles_w = RunToggles(
+    use_pandora_optimization=True,
+    use_pandora_widgetization=True,
+    pandora_config_path="pandora_db.json",
+)
+cfg_w = make_planner_config(toggles_w)
+```
+
+When `PANDORA_SRC_PATH` is not set or the database is unreachable, the bridge
+reports `available=False` and both strategies silently fall back to `FitCutCutStrategy`.
+
+---
+
 ## Package Structure
 
 The scheduler is implemented as the `qdc-sched` package under `src/qdc_sched/`:
@@ -79,13 +163,19 @@ src/qdc_sched/
 │   └── resources.py     # Resource tracking helpers
 │
 ├── cutting/
-│   ├── fitcut.py        # FitCutCutStrategy: primary cutting strategy,
-│   │                    #   uses qiskit-addon-cutting under the hood
-│   ├── qiskit_addon.py  # QiskitAddonCutStrategy: direct addon wrapper
-│   ├── assignment.py    # MinMakespanGreedyAssignment: assigns subcircuits
-│   │                    #   to QPUs to minimise makespan
-│   └── base.py          # Abstract CutStrategy, CutConstraints,
-│                        #   CutAnalysis, PartitionPlan interfaces
+│   ├── fitcut.py             # FitCutCutStrategy: primary cutting strategy,
+│   │                         #   uses qiskit-addon-cutting under the hood
+│   ├── qiskit_addon.py       # QiskitAddonCutStrategy: direct addon wrapper
+│   ├── assignment.py         # MinMakespanGreedyAssignment: assigns subcircuits
+│   │                         #   to QPUs to minimise makespan
+│   ├── base.py               # Abstract CutStrategy, CutConstraints,
+│   │                         #   CutAnalysis, PartitionPlan interfaces
+│   ├── pandora_bridge.py     # PandoraBridge: async PostgreSQL bridge to Pandora;
+│   │                         #   auto-transpiles to Pandora basis, runs SQL rewrites
+│   ├── pandora_optimizer.py  # PandoraOptimizedCutStrategy: runs Pandora gate
+│   │                         #   cancellation then delegates to FitCut
+│   └── pandora_widgetizer.py # PandoraWidgetizerStrategy: Pandora widget-based
+│                             #   partitioning with FitCut fallback
 │
 ├── ibm/
 │   ├── fake_loader.py       # Load Qiskit fake IBM backends for simulation
