@@ -505,36 +505,39 @@ def fig08q(e3p, e3p_gc, od):
     ax3.legend(loc="upper right", fontsize=7, framealpha=0.7)
 
     # Panel 4: gate count and depth before vs after Pandora (from e3p_gate_counts.csv)
-    if e3p_gc:
-        gb = [sf(r.get("gates_before")) for r in e3p_gc if sf(r.get("gates_before")) is not None]
-        ga = [sf(r.get("gates_after"))  for r in e3p_gc if sf(r.get("gates_after"))  is not None]
-        db = [sf(r.get("depth_before")) for r in e3p_gc if sf(r.get("depth_before")) is not None]
-        da = [sf(r.get("depth_after"))  for r in e3p_gc if sf(r.get("depth_after"))  is not None]
-        avg_gb = statistics.mean(gb) if gb else 0
-        avg_ga = statistics.mean(ga) if ga else 0
-        avg_db = statistics.mean(db) if db else 0
-        avg_da = statistics.mean(da) if da else 0
+    gb = [sf(r.get("gates_before")) for r in (e3p_gc or []) if sf(r.get("gates_before")) is not None]
+    ga = [sf(r.get("gates_after"))  for r in (e3p_gc or []) if sf(r.get("gates_after"))  is not None]
+    db = [sf(r.get("depth_before")) for r in (e3p_gc or []) if sf(r.get("depth_before")) is not None]
+    da = [sf(r.get("depth_after"))  for r in (e3p_gc or []) if sf(r.get("depth_after"))  is not None]
+    avg_gb = statistics.mean(gb) if gb else 0
+    avg_ga = statistics.mean(ga) if ga else 0
+    avg_db = statistics.mean(db) if db else 0
+    avg_da = statistics.mean(da) if da else 0
 
+    if avg_gb > 0 or avg_db > 0:
         bx = np.array([0, 1])
         before_vals = [avg_gb, avg_db]
         after_vals  = [avg_ga, avg_da]
         bw = 0.32
+        ymax = max(before_vals) * 1.35
         bars_b = ax4.bar(bx - bw/2, before_vals, width=bw, color=GRAY,  label="Before", alpha=0.85, edgecolor="white")
         bars_a = ax4.bar(bx + bw/2, after_vals,  width=bw, color=PURPLE, label="After",  alpha=0.85, edgecolor="white")
         for bar, v in zip(bars_b, before_vals):
-            ax4.text(bar.get_x() + bar.get_width()/2, v + 0.3, f"{v:.1f}", ha="center", va="bottom", fontsize=8)
+            ax4.text(bar.get_x() + bar.get_width()/2, v + ymax * 0.01, f"{v:.1f}",
+                     ha="center", va="bottom", fontsize=8, clip_on=True)
         for bar, v, bv in zip(bars_a, after_vals, before_vals):
             pct = 100 * (bv - v) / bv if bv else 0
-            ax4.text(bar.get_x() + bar.get_width()/2, v + 0.3, f"{v:.1f}\n(−{pct:.0f}%)",
-                     ha="center", va="bottom", fontsize=7.5, color=PURPLE)
+            ax4.text(bar.get_x() + bar.get_width()/2, v + ymax * 0.01,
+                     f"{v:.1f}\n(−{pct:.0f}%)",
+                     ha="center", va="bottom", fontsize=7.5, color=PURPLE, clip_on=True)
         ax4.set_xticks(bx)
         ax4.set_xticklabels(["Gate count", "Depth"], fontsize=9)
         ax4.set_ylabel("Count")
         ax4.set_title("Pandora optimization\n(gates & depth reduced)")
         ax4.legend(fontsize=8, framealpha=0.7)
-        ax4.set_ylim(0, max(before_vals) * 1.3)
+        ax4.set_ylim(0, ymax)
     else:
-        ax4.text(0.5, 0.5, "No gate count data\n(run E3P to generate)", ha="center",
+        ax4.text(0.5, 0.5, "No gate count data\n(run E3P with Pandora connected)", ha="center",
                  va="center", transform=ax4.transAxes, fontsize=9, color=GRAY)
         ax4.set_title("Pandora optimization")
 
