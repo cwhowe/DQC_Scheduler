@@ -793,12 +793,18 @@ def exp_e3p_pandora_stress(args, path: str) -> None:
     print("  Pandora should cancel these pairs before FitCut sees the circuit")
 
     gate_counts_path = os.path.join(os.path.dirname(path), "e3p_gate_counts.csv")
+    # Always start fresh so stale data from previous runs doesn't corrupt the schema.
+    if os.path.exists(gate_counts_path):
+        os.remove(gate_counts_path)
 
     conditions = [
         ("fitcut_baseline",    "fitcut",              True, True),
         ("pandora_optimized",  "pandora_optimized",   True, True),
         ("pandora_widgetizer", "pandora_widgetizer",  True, True),
     ]
+
+    timing_mode = getattr(args, "timing_mode", "analytic")
+    print(f"  Timing mode: {timing_mode}")
 
     first = True
     for cname, strategy_name, allow_cut, allow_multi in conditions:
@@ -813,12 +819,14 @@ def exp_e3p_pandora_stress(args, path: str) -> None:
             bridge = PandoraBridge(config_path=os.environ.get("PANDORA_CONFIG_PATH", ""))
             pandora_strategy_obj = PandoraOptimizedCutStrategy(bridge=bridge)
             sched = build_scheduler(qpus, allow_cutting=allow_cut,
-                                    allow_multi_qpu=allow_multi, cut_strategy="fitcut", max_cuts=2)
+                                    allow_multi_qpu=allow_multi, cut_strategy="fitcut",
+                                    max_cuts=2, timing_mode=timing_mode)
             sched.cfg.planner.cut_strategy = pandora_strategy_obj
         else:
             sched = build_scheduler(qpus, allow_cutting=allow_cut,
                                     allow_multi_qpu=allow_multi,
-                                    cut_strategy=strategy_name, max_cuts=2)
+                                    cut_strategy=strategy_name, max_cuts=2,
+                                    timing_mode=timing_mode)
 
         wl = pandora_stress_workload(args.n_jobs, seed=args.seed)
         toggles = RunToggles(simulate_only=False)
@@ -844,8 +852,15 @@ def exp_e3p_pandora_stress(args, path: str) -> None:
                 }
                 for i, (b, a, db, da) in enumerate(log)
             ]
+            gc_fieldnames = ["circuit_idx", "gates_before", "gates_after",
+                             "gates_cancelled", "pct_reduction",
+                             "depth_before", "depth_after", "depth_reduction"]
             gc_first = not os.path.exists(gate_counts_path)
-            append_rows(gate_counts_path, gc_rows, write_header=gc_first)
+            with open(gate_counts_path, "w" if gc_first else "a", newline="") as _f:
+                _w = csv.DictWriter(_f, fieldnames=gc_fieldnames)
+                if gc_first:
+                    _w.writeheader()
+                _w.writerows(gc_rows)
             avg_gates = sum(b for b, a, *_ in log) / len(log)
             avg_after = sum(a for b, a, *_ in log) / len(log)
             avg_db = sum(db for *_, db, da in log) / len(log)
@@ -1865,6 +1880,14 @@ def parse_args():
     )
     p.add_argument("--fast", action="store_true",
                    help="Use n_jobs=20 for quick iteration")
+    p.add_argument(
+        "--timing-mode",
+        default=os.getenv("QDC_QPU_TIMING_MODE", "analytic"),
+        choices=["analytic", "aer", "backend_profile"],
+        help="QPU execution timing model (default: analytic). "
+             "'aer' measures real Aer wall-clock time per subcircuit. "
+             "Also controlled by QDC_QPU_TIMING_MODE env var.",
+    )
     return p.parse_args()
 
 
