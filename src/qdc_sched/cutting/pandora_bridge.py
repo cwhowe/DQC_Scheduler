@@ -61,6 +61,9 @@ def _ensure_pandora_on_path() -> None:
     _stub("pandora.multithreading")
     _stub("pandora.multithreading.parallel_decompose", worker_entry=None)
 
+    # pandora.multithreading pulls in pyLIQTR; we never call it via the bridge
+    # No cirq/qualtran stubs — those are real Pandora deps that must be installed.
+
 
 def _pandora_importable() -> bool:
     """Check only the submodules the bridge actually uses."""

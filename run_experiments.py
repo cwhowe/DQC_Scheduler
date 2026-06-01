@@ -208,10 +208,10 @@ def make_qpu(
     return QPUState(prof)
 
 
-def default_qpu_pool(n_qpus: int = 2, n_qubits: int = 7) -> Dict[str, QPUState]:
+def default_qpu_pool(n_qpus: int = 2, n_qubits: int = 7, **qpu_kwargs) -> Dict[str, QPUState]:
     """Homogeneous line-topology pool — baseline for most experiments."""
     return {
-        f"qpu_{chr(65+i)}": make_qpu(f"qpu_{chr(65+i)}", n_qubits)
+        f"qpu_{chr(65+i)}": make_qpu(f"qpu_{chr(65+i)}", n_qubits, **qpu_kwargs)
         for i in range(n_qpus)
     }
 
@@ -667,56 +667,79 @@ def cutting_stress_workload(
     return wl
 
 
+def _build_pandora_block(qc: "QuantumCircuit", qubits: list, rng: random.Random, depth: int, n_pairs: int) -> None:
+    """Append a random FT-basis layer followed by within-block cancellable pairs onto qubits."""
+    n = len(qubits)
+    for _ in range(depth):
+        q = qubits[rng.randint(0, n - 1)]
+        r = rng.random()
+        if r < 0.30:
+            qc.t(q)
+        elif r < 0.55:
+            qc.tdg(q)
+        elif r < 0.68:
+            qc.h(q)
+        elif r < 0.80:
+            qi = rng.randint(0, n - 1)
+            qj = (qi + 1) % n
+            qc.cx(qubits[qi], qubits[qj])
+        elif r < 0.90:
+            qc.s(q)
+        else:
+            qc.sdg(q)
+
+    for _ in range(n_pairs):
+        # Single-qubit pairs only — guaranteed within this block after any cut.
+        q = qubits[rng.randint(0, n - 1)]
+        r = rng.random()
+        if r < 0.40:
+            qc.t(q);   qc.tdg(q)    # T / Tdg  → cancel
+        elif r < 0.70:
+            qc.h(q);   qc.h(q)      # H / H    → cancel
+        else:
+            qc.s(q);   qc.sdg(q)    # S / Sdg  → cancel
+
+
 def pandora_stress_workload(n_jobs: int, seed: int = 42) -> List[Tuple[float, Job]]:
-    """T-gate-heavy circuits with explicit adjacent cancellable pairs.
+    """Blocked circuits with within-partition cancellable pairs.
 
-    Each circuit is built in the fault-tolerant {H, T, Tdg, S, Sdg, CX} basis
-    and contains two layers:
-      1. A base random T-gate circuit (depth 15-25).
-      2. A cancellation layer of n_pairs adjacent inverse pairs: T/Tdg, H/H,
-         CX/CX, S/Sdg appended immediately after one another on the same qubit
-         so Pandora's SQL rewrite rules can cancel them.
+    Each circuit has two qubit blocks connected by a small number of CX gates
+    that serve as the natural cut boundary for FitCut:
 
-    Circuits are 9-14 qubits (wider than the 7-qubit QPU pool) to force cutting.
+        Block A (qubits 0..split-1)        Block B (qubits split..n-1)
+        ┌─ FT basis + cancel pairs ─┐      ┌─ FT basis + cancel pairs ─┐
+        │  T/Tdg, H/H, S/Sdg pairs  │──CX──│  T/Tdg, H/H, S/Sdg pairs  │
+        └───────────────────────────┘      └───────────────────────────┘
+
+    After FitCut splits at the inter-block CX, each subcircuit retains its own
+    single-qubit cancellable pairs.  Pandora can then cancel them within each
+    piece, giving measurable gate reduction and latency improvement.
+
+    Only single-qubit pairs are used in the cancellation layer — they are always
+    confined to one qubit and therefore always survive the cut intact.
     """
     rng = random.Random(seed)
     wl = []
     t = 0.0
     for i in range(n_jobs):
         t += rng.expovariate(1.0)
-        n = rng.choice([9, 10, 11, 12, 13, 14])
+        n = rng.choice([10, 12, 14])          # even widths simplify equal split
         shots = rng.choice([500, 1000])
+        split = n // 2                         # equal blocks
         qc = QuantumCircuit(n)
 
-        # Base layer: random fault-tolerant basis circuit
-        for _ in range(rng.randint(15, 25)):
-            q = rng.randint(0, n - 1)
-            r = rng.random()
-            if r < 0.30:
-                qc.t(q)
-            elif r < 0.55:
-                qc.tdg(q)
-            elif r < 0.68:
-                qc.h(q)
-            elif r < 0.80:
-                qc.cx(q, (q + 1) % n)
-            elif r < 0.90:
-                qc.s(q)
-            else:
-                qc.sdg(q)
+        block_a = list(range(split))
+        block_b = list(range(split, n))
 
-        # Cancellation layer: adjacent inverse pairs that Pandora should cancel
-        for _ in range(rng.randint(10, 18)):
-            q = rng.randint(0, n - 1)
-            r = rng.random()
-            if r < 0.40:
-                qc.t(q);   qc.tdg(q)            # T / Tdg  → cancel
-            elif r < 0.62:
-                qc.h(q);   qc.h(q)              # H / H    → cancel
-            elif r < 0.78:
-                qc.cx(q, (q + 1) % n); qc.cx(q, (q + 1) % n)  # CX / CX → cancel
-            else:
-                qc.s(q);   qc.sdg(q)            # S / Sdg  → cancel
+        # Each block: random FT-basis gates + cancellable pairs
+        _build_pandora_block(qc, block_a, rng, depth=rng.randint(8, 14), n_pairs=rng.randint(5, 9))
+        _build_pandora_block(qc, block_b, rng, depth=rng.randint(8, 14), n_pairs=rng.randint(5, 9))
+
+        # Inter-block entanglement: 1-2 CX gates → FitCut's natural cut boundary
+        for _ in range(rng.randint(1, 2)):
+            qa = rng.choice(block_a)
+            qb = rng.choice(block_b)
+            qc.cx(qa, qb)
 
         job = Job(
             job_id=f"PS{i:04d}",
@@ -780,17 +803,18 @@ def exp_e3_algorithm_comparison(args, path: str) -> None:
 def exp_e3p_pandora_stress(args, path: str) -> None:
     """E3P: Compare cutting strategies on circuits designed for Pandora optimization.
 
-    Uses pandora_stress_workload() which generates T-gate-heavy circuits with
-    explicit adjacent inverse pairs (T/Tdg, H/H, CX/CX, S/Sdg) that Pandora's
-    SQL rewrite rules can cancel. The base circuit layer provides realistic
-    non-trivial structure; the cancellation layer gives Pandora work to do.
+    Uses pandora_stress_workload() which generates two-block circuits where each
+    block contains single-qubit cancellable pairs (T/Tdg, H/H, S/Sdg).  Blocks
+    are connected by 1-2 inter-block CX gates that form FitCut's natural cut
+    boundary.  After cutting, each subcircuit retains its own cancellable pairs
+    so Pandora can reduce gate count within each piece.
 
     Also writes e3p_gate_counts.csv with per-circuit gate/depth before vs after
     Pandora optimization, so the raw optimization effect is separately visible.
     """
     print("\n=== E3P: Pandora stress workload (cancellable-pair circuits) ===")
-    print("  Workload: T-gate-heavy circuits with adjacent T/Tdg, H/H, CX/CX pairs")
-    print("  Pandora should cancel these pairs before FitCut sees the circuit")
+    print("  Workload: blocked circuits; each partition has within-block T/Tdg, H/H, S/Sdg pairs")
+    print("  Pandora cancels pairs within each subcircuit after FitCut splits at inter-block CX")
 
     gate_counts_path = os.path.join(os.path.dirname(path), "e3p_gate_counts.csv")
     # Always start fresh so stale data from previous runs doesn't corrupt the schema.
@@ -798,14 +822,15 @@ def exp_e3p_pandora_stress(args, path: str) -> None:
         os.remove(gate_counts_path)
 
     conditions = [
-        ("fitcut_baseline",    "fitcut",              True, True),
-        ("pandora_optimized",  "pandora_optimized",   True, True),
-        ("pandora_widgetizer", "pandora_widgetizer",  True, True),
+        ("fitcut_baseline",   "fitcut",            True, True),
+        ("pandora_optimized", "pandora_optimized", True, True),
     ]
 
     timing_mode = getattr(args, "timing_mode", "analytic")
     print(f"  Timing mode: {timing_mode}")
 
+    # shot_overhead_s=0 isolates gate-time differences; default 250µs/shot would
+    # otherwise dominate and mask any Pandora gate-reduction benefit.
     first = True
     for cname, strategy_name, allow_cut, allow_multi in conditions:
         print(f"  Running condition: {cname}")
@@ -869,6 +894,93 @@ def exp_e3p_pandora_stress(args, path: str) -> None:
                   f"({100*(avg_gates-avg_after)/avg_gates:.1f}%)")
             print(f"    depth reduction: {avg_db:.1f} → {avg_da:.1f} "
                   f"({100*(avg_db-avg_da)/avg_db:.1f}%)")
+
+
+# ---------------------------------------------------------------------------
+# Experiment E3PFT: Pandora in fault-tolerant regime (T-gate overhead = 50)
+# ---------------------------------------------------------------------------
+
+def exp_e3p_fault_tolerant(args, path: str) -> None:
+    """E3PFT: Same workload as E3P but with fault-tolerant hardware model.
+
+    Sets T-gate overhead = 50 (magic-state distillation cost), shot_overhead = 0,
+    and communication/reconstruction overhead = 0 so that gate time alone
+    determines latency.  In a real fault-tolerant machine the classical coordination
+    model from the near-term DQC regime does not apply; this models the idealised
+    case where T-gate cost (magic-state factories) dominates.
+
+    The contrast with E3P (near-term, shot overhead dominates, no latency gain)
+    illustrates where Pandora's T-gate reduction delivers value.
+    """
+    print("\n=== E3PFT: Pandora stress — fault-tolerant hardware model ===")
+    print("  T-gate overhead = 50x (magic-state distillation), shot/comm/recon overhead = 0")
+    print("  Pure gate-time regime: T-gate reduction directly lowers latency")
+
+    conditions = [
+        ("fitcut_baseline",   "fitcut",            True, True),
+        ("pandora_optimized", "pandora_optimized", True, True),
+    ]
+
+    # Zero all non-gate overheads so gate time dominates.
+    # Shot overhead is per-QPU; comm/recon overheads are read from env vars.
+    _ft_env = {
+        "QDC_COMM_BASE_S": "0.0",
+        "QDC_COMM_PER_EXEC_S": "0.0",
+        "QDC_COMM_PER_SAMPLE_S": "0.0",
+        "QDC_COMM_COORD_PER_EXTRA_QPU_S": "0.0",
+        "QDC_HOST_RECON_BASE_S": "0.0",
+        "QDC_HOST_RECON_PER_EXEC_S": "0.0",
+    }
+    _saved_env = {k: os.environ.get(k) for k in _ft_env}
+    os.environ.update(_ft_env)
+
+    try:
+        first = True
+        for cname, strategy_name, allow_cut, allow_multi in conditions:
+            print(f"  Running condition: {cname}")
+            qpus = default_qpu_pool(n_qpus=2, n_qubits=7, shot_overhead_s=0.0)
+            # Apply T-gate overhead to every QPU profile
+            import dataclasses
+            for qstate in qpus.values():
+                qstate.profile = dataclasses.replace(qstate.profile, t_gate_overhead=50.0)
+
+            pandora_strategy_obj = None
+            if strategy_name == "pandora_optimized":
+                from qdc_sched.cutting.pandora_bridge import PandoraBridge
+                from qdc_sched.cutting.pandora_optimizer import PandoraOptimizedCutStrategy
+                bridge = PandoraBridge(config_path=os.environ.get("PANDORA_CONFIG_PATH", ""))
+                pandora_strategy_obj = PandoraOptimizedCutStrategy(bridge=bridge)
+                sched = build_scheduler(qpus, allow_cutting=allow_cut,
+                                        allow_multi_qpu=allow_multi, cut_strategy="fitcut",
+                                        max_cuts=2, timing_mode="analytic")
+                sched.cfg.planner.cut_strategy = pandora_strategy_obj
+            else:
+                sched = build_scheduler(qpus, allow_cutting=allow_cut,
+                                        allow_multi_qpu=allow_multi,
+                                        cut_strategy=strategy_name, max_cuts=2,
+                                        timing_mode="analytic")
+
+            wl = pandora_stress_workload(args.n_jobs, seed=args.seed)
+            toggles = RunToggles(simulate_only=False)
+            records = run_tick_loop(sched, wl, toggles)
+            rows = [record_to_row(r, "E3PFT_pandora_stress", cname) for r in records]
+            append_rows(path, rows, write_header=first)
+            first = False
+            print(f"    → {len(records)} jobs completed")
+
+            if pandora_strategy_obj is not None and pandora_strategy_obj.gate_count_log:
+                log = pandora_strategy_obj.gate_count_log
+                avg_b = sum(b for b, a, *_ in log) / len(log)
+                avg_a = sum(a for b, a, *_ in log) / len(log)
+                print(f"    gate reduction: {avg_b:.1f} → {avg_a:.1f} "
+                      f"({100*(avg_b-avg_a)/avg_b:.1f}%)")
+    finally:
+        # Restore original env vars
+        for k, v in _saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 # ---------------------------------------------------------------------------
@@ -1899,7 +2011,8 @@ def run_selected_experiments(args, outdir: str) -> None:
         "E1": (exp_e1_plan_comparison,    "e1_plan_comparison.csv"),
         "E2": (exp_e2_workload_variation, "e2_workload_variation.csv"),
         "E3": (exp_e3_algorithm_comparison, "e3_algorithm_comparison.csv"),
-        "E3P": (exp_e3p_pandora_stress,    "e3p_pandora_stress.csv"),
+        "E3P":   (exp_e3p_pandora_stress,        "e3p_pandora_stress.csv"),
+        "E3PFT": (exp_e3p_fault_tolerant,        "e3p_fault_tolerant.csv"),
         "E4": (exp_e4_qpu_diversity,      "e4_qpu_diversity.csv"),
         "E5": (exp_e5_batch_vs_stream,    "e5_batch_vs_stream.csv"),
         "E6": (exp_e6_width_sweep,        "e6_width_sweep.csv"),
@@ -1919,7 +2032,7 @@ def run_selected_experiments(args, outdir: str) -> None:
     print(f"[EXPERIMENTS] running: {sorted(wanted)}")
     t0 = time.time()
 
-    for key in ["E1","E2","E3","E3P","E4","E5","E6","E7","E8","E9","E10","E11","E12","E13","E14","E15","E16"]:
+    for key in ["E1","E2","E3","E3P","E3PFT","E4","E5","E6","E7","E8","E9","E10","E11","E12","E13","E14","E15","E16"]:
         if key not in wanted:
             continue
         fn, fname = dispatch[key]

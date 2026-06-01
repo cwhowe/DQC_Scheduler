@@ -258,6 +258,26 @@ class Executor:
             s = repr(circ)
         return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
+    @staticmethod
+    def _strip_cut_instructions(circ: QuantumCircuit) -> QuantumCircuit:
+        """Return a copy of circ with qiskit-addon-cutting boundary ops removed.
+
+        Wire-cut subcircuits contain 'In' and 'Out' channel instructions that
+        Aer cannot simulate.  For timing purposes we only need the gate structure,
+        so we drop any instruction whose name is not in a known-Aer-safe set.
+        """
+        _AER_SAFE = frozenset({
+            "h", "x", "y", "z", "s", "sdg", "t", "tdg",
+            "sx", "sxdg", "rx", "ry", "rz", "u", "u1", "u2", "u3",
+            "cx", "cy", "cz", "ch", "swap", "iswap", "ecr",
+            "ccx", "cswap", "reset", "barrier", "measure", "delay",
+        })
+        out = QuantumCircuit(circ.num_qubits)
+        for inst in circ.data:
+            if inst.operation.name.lower() in _AER_SAFE:
+                out.append(inst.operation, inst.qubits)
+        return out
+
     def _measure_exec_time_s_aer(
         self,
         circ: QuantumCircuit,
@@ -310,25 +330,34 @@ class Executor:
             )
             return float(dur)
 
-        key = (qid, self._hash_circuit(circ), eff_shots, str(task_type), bool(getattr(self.cfg, "aer_timing_use_noise", False)))
+        # Strip cut-boundary instructions (In/Out) that Aer cannot simulate.
+        # For timing we only need the gate structure; the cut scaffolding is irrelevant.
+        aer_circ = self._strip_cut_instructions(circ)
+        key = (qid, self._hash_circuit(aer_circ), eff_shots, str(task_type), bool(getattr(self.cfg, "aer_timing_use_noise", False)))
         if key in self._aer_timing_cache:
             return float(self._aer_timing_cache[key])
 
         try:
             dur = self._measure_exec_time_s_aer(
-                circ=circ,
+                circ=aer_circ,
                 shots=eff_shots,
                 task_type=str(task_type),
                 observables=observables,
                 use_noise=bool(getattr(self.cfg, "aer_timing_use_noise", False)),
                 repeats=int(getattr(self.cfg, "aer_timing_repeats", 1) or 1),
             )
-        except Exception:
+        except Exception as _aer_exc:
+            import os as _os, traceback as _tb
+            if _os.getenv("QDC_AER_DEBUG", "0") == "1":
+                print(f"[AER_FALLBACK] qid={qid} circ={getattr(aer_circ,'name','?')} "
+                      f"n_qubits={getattr(aer_circ,'num_qubits','?')} n_clbits={getattr(aer_circ,'num_clbits','?')} "
+                      f"err={_aer_exc!r}")
+                _tb.print_exc()
             from qdc_sched.core.profiler import profile_circuit
-            sp = profile_circuit(circ)
+            sp = profile_circuit(aer_circ)
             dur, _meta = estimate_qpu_execution_s(
                 self.qpus[qid].profile,
-                circuit=circ,
+                circuit=aer_circ,
                 prof=sp,
                 shots=eff_shots,
             )

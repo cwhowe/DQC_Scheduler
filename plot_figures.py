@@ -546,6 +546,96 @@ def fig08q(e3p, e3p_gc, od):
     fig.tight_layout()
     _save(fig, f"{od}/fig08q_pandora_stress")
 
+
+def fig08r(e3p, e3p_gc, e3p_ft, od):
+    """Regime comparison: Pandora benefit in near-term vs fault-tolerant hardware.
+
+    Two-column layout:
+      Left  — Near-term (Aer timing, 250µs shot overhead): latency unchanged
+      Right — Fault-tolerant (analytic, T×50, shot_overhead=0): latency improved
+
+    Both columns share the same gate-reduction panel so the reader can see the
+    same circuit-level improvement translates differently depending on hardware.
+    """
+    conds  = ["fitcut_baseline", "pandora_optimized"]
+    labels = ["FitCut\n(baseline)", "Pandora +\nFitCut"]
+    colors = [TEAL, BLUE]
+    w = 0.50
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 3.8),
+                             gridspec_kw={"width_ratios": [1, 1, 0.85]})
+    ax_nt, ax_ft, ax_gc = axes
+
+    def _latency_panel(ax, data, title, regime_note, metric="end_to_end_s", ylabel=None):
+        present = {r.get("condition") for r in data}
+        ci = [i for i, c in enumerate(conds) if c in present]
+        cl = [labels[i] for i in ci]
+        cc = [colors[i] for i in ci]
+        x  = np.arange(len(ci))
+        vals = [statistics.median(vp(data, metric, conds[i]) or [0]) for i in ci]
+        baseline = vals[0] if vals else 1.0
+        ax.bar(x, vals, width=w, color=cc, edgecolor="white", linewidth=0.5)
+        for xi, v in zip(x, vals):
+            pct = 100 * (v - baseline) / baseline if baseline else 0
+            sign = "+" if pct >= 0 else ""
+            lbl = f"{v:.2f}s" if xi == 0 else f"{v:.2f}s\n({sign}{pct:.1f}%)"
+            ax.text(xi, v + max(vals) * 0.02, lbl, ha="center", va="bottom", fontsize=8.5)
+        ax.set_xticks(x); ax.set_xticklabels(cl, fontsize=9)
+        ax.set_ylabel(ylabel or "Median end-to-end (s)")
+        ax.set_title(title, fontsize=10, fontweight="bold")
+        ax.set_ylim(0, max(vals) * 1.35 if vals else 1)
+        ax.text(0.5, 0.97, regime_note, transform=ax.transAxes,
+                ha="center", va="top", fontsize=7.5, color="gray", style="italic")
+
+    _latency_panel(ax_nt, e3p or [],
+                   "Near-term hardware",
+                   "Analytic · 250 µs shot overhead · T-overhead = 1×",
+                   metric="end_to_end_s", ylabel="Median end-to-end (s)")
+    _latency_panel(ax_ft, e3p_ft or [],
+                   "Fault-tolerant hardware",
+                   "Analytic · shot/comm overhead = 0 · T-overhead = 50×",
+                   metric="t_execution_s", ylabel="Median execution time (s)")
+
+    # Shared gate-reduction panel (same for both regimes — circuit-level result)
+    gb = [sf(r.get("gates_before")) for r in (e3p_gc or []) if sf(r.get("gates_before")) is not None]
+    ga = [sf(r.get("gates_after"))  for r in (e3p_gc or []) if sf(r.get("gates_after"))  is not None]
+    db = [sf(r.get("depth_before")) for r in (e3p_gc or []) if sf(r.get("depth_before")) is not None]
+    da = [sf(r.get("depth_after"))  for r in (e3p_gc or []) if sf(r.get("depth_after"))  is not None]
+    avg_gb = statistics.mean(gb) if gb else 0
+    avg_ga = statistics.mean(ga) if ga else 0
+    avg_db = statistics.mean(db) if db else 0
+    avg_da = statistics.mean(da) if da else 0
+
+    if avg_gb > 0 or avg_db > 0:
+        bx  = np.array([0, 1])
+        bfore = [avg_gb, avg_db]
+        baft  = [avg_ga, avg_da]
+        bw = 0.30
+        ymax = max(bfore) * 1.40
+        ax_gc.bar(bx - bw/2, bfore, width=bw, color=GRAY,   label="Before", alpha=0.85, edgecolor="white")
+        ax_gc.bar(bx + bw/2, baft,  width=bw, color=PURPLE,  label="After",  alpha=0.85, edgecolor="white")
+        for xb, v in zip(bx, bfore):
+            ax_gc.text(xb - bw/2, v + ymax * 0.01, f"{v:.1f}", ha="center", va="bottom", fontsize=8)
+        for xb, v, bv in zip(bx, baft, bfore):
+            pct = 100 * (bv - v) / bv if bv else 0
+            ax_gc.text(xb + bw/2, v + ymax * 0.01, f"{v:.1f}\n(−{pct:.0f}%)",
+                       ha="center", va="bottom", fontsize=7.5, color=PURPLE)
+        ax_gc.set_xticks(bx); ax_gc.set_xticklabels(["Gate count", "Depth"], fontsize=9)
+        ax_gc.set_ylabel("Count")
+        ax_gc.set_ylim(0, ymax)
+        ax_gc.set_title("Pandora optimization\n(circuit level — both regimes)", fontsize=10, fontweight="bold")
+        ax_gc.legend(fontsize=8, framealpha=0.7)
+    else:
+        ax_gc.text(0.5, 0.5, "No gate count data\n(run E3P with Pandora connected)",
+                   ha="center", va="center", transform=ax_gc.transAxes, fontsize=9, color=GRAY)
+        ax_gc.set_title("Pandora optimization")
+
+    fig.suptitle("Pandora gate reduction: near-term vs fault-tolerant hardware",
+                 fontsize=12, fontweight="bold", y=1.02)
+    fig.tight_layout()
+    _save(fig, f"{od}/fig08r_pandora_regimes")
+
+
 # ── Fig 9: QPU load + Gini (E4) ─────────────────────────────────────────────
 def fig09(e4, od):
     """E4: Fidelity gain and plan mix across QPU pool configurations."""
@@ -3194,6 +3284,7 @@ _FIGURE_REGISTRY = {
     "8":   (fig08,                     ["e3"]),
     "8p":  (fig08p,                    ["e3"]),
     "8q":  (fig08q,                    ["e3p", "e3p_gc"]),
+    "8r":  (fig08r,                    ["e3p", "e3p_gc", "e3p_ft"]),
     "9":   (fig09,                     ["e4"]),
     "10":  (fig10,                     ["e4"]),
     "11":  (fig11,                     ["e5"]),
@@ -3305,6 +3396,7 @@ def main():
     e3  = _try_load_csv(indir,  "e3_algorithm_comparison.csv")
     e3p     = _try_load_csv(indir,  "e3p_pandora_stress.csv")
     e3p_gc  = _try_load_csv(indir,  "e3p_gate_counts.csv")
+    e3p_ft  = _try_load_csv(indir,  "e3p_fault_tolerant.csv")
     e4  = _try_load_csv(indir,  "e4_qpu_diversity.csv")
     e5  = _try_load_csv(indir,  "e5_batch_vs_stream.csv")
     e6  = _try_load_csv(indir,  "e6_width_sweep.csv")
@@ -3334,7 +3426,8 @@ def main():
     named = [(n, r) for n, r in [("E1",e1),("E2",e2),("E3",e3),("E4",e4),("E5",e5)] if r]
 
     data = dict(
-        e1=e1, e2=e2, e3=e3, e3p=e3p, e3p_gc=e3p_gc, e4=e4, e5=e5, e6=e6, e7=e7, e8=e8,
+        e1=e1, e2=e2, e3=e3, e3p=e3p, e3p_gc=e3p_gc, e3p_ft=e3p_ft,
+        e4=e4, e5=e5, e6=e6, e7=e7, e8=e8,
         e9=e9, e10=e10, e11=e11, e12=e12, e13=e13, e14=e14, e15=e15, e16=e16,
         e20=e20, e15_json=e15_json, e18_json=e18_json,
         e21_json=e21_json, e24_json=e24_json, named=named,
