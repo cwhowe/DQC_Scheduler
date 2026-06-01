@@ -73,6 +73,10 @@ class PandoraWidgetizerStrategy(CutStrategy):
             return self.fallback.partition(circuit, constraints, context)
         subcircuits = self._get_subcircuits(circuit)
         if not subcircuits:
+            import os
+            if os.getenv("QDC_AER_DEBUG", "0") == "1":
+                print(f"[WIDGETIZER_FALLBACK] widgetize() returned [] for "
+                      f"{circuit.num_qubits}q circuit, falling back to FitCut")
             return self.fallback.partition(circuit, constraints, context)
         return PartitionPlan(
             kind="pandora_widgetizer",

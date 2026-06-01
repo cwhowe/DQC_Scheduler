@@ -10,10 +10,17 @@ from .pandora_bridge import PandoraBridge
 
 
 class PandoraOptimizedCutStrategy(CutStrategy):
-    """Pre-optimize a circuit through Pandora SQL rewrites, then delegate to FitCutCutStrategy.
+    """Pandora gate-cancellation + FitCut circuit partitioning.
 
-    If Pandora is unavailable or optimization fails, the original circuit is passed
-    unchanged to the fallback strategy.
+    Strategy:
+    1. FitCut the ORIGINAL circuit to establish the plan type (A/B/C) and
+       number of subcircuits — so the planner sees the real interaction graph.
+    2. Pandora-optimize the FULL circuit before re-cutting it.
+    3. If the Pandora-optimized circuit produces at least as many subcircuits
+       as the original, use the optimized plan (gate savings + correct plan type).
+    4. If optimization collapsed the graph (fewer subcircuits), fall back to
+       per-subcircuit optimization of the original plan — preserving plan type
+       at the cost of gate savings that span cut boundaries.
     """
 
     name = "pandora_optimized"
@@ -28,24 +35,13 @@ class PandoraOptimizedCutStrategy(CutStrategy):
         # Each entry: (gates_before, gates_after, depth_before, depth_after)
         self.gate_count_log: list = []
 
-    def _optimized(self, circuit: QuantumCircuit) -> QuantumCircuit:
-        gates_before = circuit.size()
-        depth_before = circuit.depth()
-        opt = self.bridge.optimize(circuit)
-        result = opt if opt is not None else circuit
-        self.gate_count_log.append((
-            gates_before, result.size(),
-            depth_before, result.depth(),
-        ))
-        return result
-
     def analyze(
         self,
         circuit: QuantumCircuit,
         constraints: CutConstraints,
         context: Dict[str, Any],
     ) -> CutAnalysis:
-        return self.fallback.analyze(self._optimized(circuit), constraints, context)
+        return self.fallback.analyze(circuit, constraints, context)
 
     def partition(
         self,
@@ -53,4 +49,39 @@ class PandoraOptimizedCutStrategy(CutStrategy):
         constraints: CutConstraints,
         context: Dict[str, Any],
     ) -> PartitionPlan:
-        return self.fallback.partition(self._optimized(circuit), constraints, context)
+        # Step 1: reference plan on the original circuit (determines plan type).
+        plan_orig = self.fallback.partition(circuit, constraints, context)
+        n_orig = len(plan_orig.subcircuits)
+
+        # Step 2: Pandora-optimize the full circuit.
+        opt = self.bridge.optimize(circuit)
+        opt_circuit = opt if opt is not None else circuit
+
+        # Step 3: Re-cut the Pandora-optimized circuit.
+        plan_opt = self.fallback.partition(opt_circuit, constraints, context)
+        n_opt = len(plan_opt.subcircuits)
+
+        if n_opt >= n_orig:
+            # Optimization didn't shrink the partition — use the optimized plan.
+            for orig_sub, opt_sub in zip(plan_orig.subcircuits, plan_opt.subcircuits):
+                self.gate_count_log.append((
+                    orig_sub.size(), opt_sub.size(),
+                    orig_sub.depth(), opt_sub.depth(),
+                ))
+            return plan_opt
+
+        # Step 4: Optimization collapsed the graph; fall back to per-subcircuit
+        # Pandora so plan type is preserved even though cross-cut pairs are lost.
+        optimized_subs = []
+        for sub in plan_orig.subcircuits:
+            gates_before = sub.size()
+            depth_before = sub.depth()
+            sub_opt = self.bridge.optimize(sub)
+            result = sub_opt if sub_opt is not None else sub
+            self.gate_count_log.append((
+                gates_before, result.size(),
+                depth_before, result.depth(),
+            ))
+            optimized_subs.append(result)
+        plan_orig.subcircuits = optimized_subs
+        return plan_orig
